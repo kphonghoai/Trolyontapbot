@@ -43,13 +43,13 @@ def save_data(data: dict):
         logger.error(f"Lỗi ghi file: {e}")
 
     async def ask_gemini(prompt: str) -> str:
-    """Gọi trực tiếp mô hình gemini-3.8-flash theo yêu cầu mới nhất của Google"""
-    model = "gemini-flash-latest"
+    """Gọi trực tiếp Google Gemini REST API với mô hình gemini-3.8-flash"""
+    model = "gemini-3.8-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
-    
+
     async with ClientSession() as session:
         try:
             async with session.post(url, json=payload, timeout=30) as resp:
@@ -63,9 +63,11 @@ def save_data(data: dict):
                     return "Không nhận được nội dung trả lời từ Gemini."
                 else:
                     err_msg = data.get("error", {}).get("message", str(data))
+                    logger.error(f"Lỗi API Gemini ({resp.status}): {err_msg}")
                     return f"Lỗi Google ({resp.status}): {err_msg}"
         except Exception as e:
-            return f"Lỗi kết nối: {str(e)}"
+            logger.error(f"Lỗi kết nối Gemini: {e}")
+            return f"Lỗi kết nối mạng: {str(e)}"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
