@@ -45,46 +45,60 @@ def save_data(data: dict):
 
 
 async def ask_ai(prompt: str) -> str:
-    """Gọi Groq REST API với mô hình llama-3.1-8b-instant"""
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    """Tự động lấy mô hình đang hoạt động trên tài khoản Groq và tạo câu trả lời"""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {
-                "role": "system",
-                "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, tự nhiên."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.6
-    }
 
     async with ClientSession() as session:
-        for retry in range(2):
-            try:
-                async with session.post(url, json=payload, headers=headers, timeout=25) as resp:
-                    data = await resp.json()
-                    if resp.status == 200:
-                        choices = data.get("choices", [])
-                        if choices:
-                            return choices[0].get("message", {}).get("content", "").strip()
-                        return "Không nhận được phản hồi từ AI."
+        # 1. Tự động truy vấn danh sách model mà tài khoản Groq này có quyền truy cập
+        active_model = "llama-3.1-8b-instant"
+        try:
+            async with session.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=10) as m_resp:
+                if m_resp.status == 200:
+                    m_data = await m_resp.json()
+                    model_list = [m["id"] for m in m_data.get("data", []) if "whisper" not in m["id"]]
+                    # Ưu tiên các model văn bản thông dụng
+                    for preferred in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it", "mixtral-8x7b-32768"]:
+                        if preferred in model_list:
+                            active_model = preferred
+                            break
                     else:
-                        err_msg = data.get("error", {}).get("message", str(data))
-                        logger.error(f"Lỗi Groq ({resp.status}): {err_msg}")
-                        if resp.status in [500, 503, 429]:
-                            await asyncio.sleep(1)
-                            continue
-                        return f"Lỗi Groq ({resp.status}): {err_msg}"
-            except Exception as e:
-                logger.error(f"Lỗi kết nối Groq: {e}")
-                await asyncio.sleep(1)
+                        if model_list:
+                            active_model = model_list[0]
+        except Exception as e:
+            logger.warning(f"Không thể lấy danh sách model động: {e}")
 
-    return "Máy chủ AI hiện đang bận, bạn vui lòng gửi lại câu hỏi sau vài giây nhé!"
+        # 2. Gửi yêu cầu với model hợp lệ vừa tìm được
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": active_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, tự nhiên."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.6
+        }
+
+        try:
+            async with session.post(url, json=payload, headers=headers, timeout=25) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    choices = data.get("choices", [])
+                    if choices:
+                        return choices[0].get("message", {}).get("content", "").strip()
+                    return "Không nhận được phản hồi từ AI."
+                else:
+                    err_msg = data.get("error", {}).get("message", str(data))
+                    logger.error(f"Lỗi Groq ({resp.status}): {err_msg}")
+                    return f"Lỗi Groq ({resp.status}) với model [{active_model}]: {err_msg}"
+        except Exception as e:
+            logger.error(f"Lỗi kết nối Groq: {e}")
+            return f"Lỗi kết nối mạng: {str(e)}"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
