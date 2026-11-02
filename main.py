@@ -46,16 +46,20 @@ def save_data(data: dict):
         logger.error(f"Lỗi ghi file: {e}")
 
 
-def ask_gemini(prompt: str) -> str:
+async def ask_gemini(prompt: str) -> str:
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+            )
         )
         return response.text
     except Exception as e:
         logger.error(f"Lỗi gọi Gemini API: {e}")
-        return "Xin lỗi, trợ lý AI hiện đang bận hoặc khóa API chưa cấu hình chính xác."
+        return f"Lỗi kết nối Gemini: {str(e)[:120]}"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,7 +206,7 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tóm tắt 1 câu ngắn gọn, sau đó đặt 2 câu hỏi tình huống hoặc kiểm tra trí nhớ để họ tự suy ngẫm. "
         "Lời văn thân thiện, súc tích bằng tiếng Việt."
     )
-    ai_question = ask_gemini(prompt)
+    ai_question = await ask_gemini(prompt)
 
     msg = f"📚 **Ôn tập bài lưu ngày {latest_note['date']}:**\n\n{ai_question}"
     await update.message.reply_text(msg)
@@ -234,7 +238,7 @@ async def handle_chat_with_gemini(update: Update, context: ContextTypes.DEFAULT_
         "Bạn là trợ lý học tập cá nhân thân thiện. Hãy trả lời câu hỏi của người dùng bằng tiếng Việt ngắn gọn, hữu ích. "
         "Nếu người dùng có ý định lưu bài học, hãy nhắc họ dùng cú pháp /save <nội dung>."
     )
-    ai_reply = ask_gemini(prompt)
+    ai_reply = await ask_gemini(prompt)
     await update.message.reply_text(ai_reply)
 
 
@@ -277,7 +281,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                         f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
                         "Hãy tạo 1 câu hỏi nhanh Active Recall bằng tiếng Việt để đánh thức trí nhớ buổi sáng."
                     )
-                    ai_q = ask_gemini(prompt)
+                    ai_q = await ask_gemini(prompt)
                     msg = f"☀️ **Khởi động trí nhớ buổi sáng (Active Recall)!**\n\n{ai_q}"
                     try:
                         await context.bot.send_message(chat_id=int(chat_id), text=msg)
@@ -296,7 +300,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                         f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
                         "Hãy đặt 1 câu hỏi tình huống thực tế chuyên sâu bằng tiếng Việt để người dùng vận dụng kiến thức này."
                     )
-                    ai_q = ask_gemini(prompt)
+                    ai_q = await ask_gemini(prompt)
                     msg = f"🎯 **Ôn tập vận dụng thực tế!**\n\n{ai_q}"
                     try:
                         await context.bot.send_message(chat_id=int(chat_id), text=msg)
@@ -357,4 +361,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
