@@ -42,41 +42,31 @@ def save_data(data: dict):
     except Exception as e:
         logger.error(f"Lỗi ghi file: {e}")
 
-async def ask_gemini(prompt: str) -> str:
-    """Tự động kiểm tra danh sách model khả dụng hoặc gọi generateContent"""
-    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    async def ask_gemini(prompt: str) -> str:
+    """Gọi trực tiếp mô hình gemini-3.8-flash theo yêu cầu mới nhất của Google"""
+    model = "gemini-3.8-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
     
     async with ClientSession() as session:
         try:
-            async with session.get(list_url, timeout=20) as resp:
+            async with session.post(url, json=payload, timeout=30) as resp:
                 data = await resp.json()
                 if resp.status == 200:
-                    models = [
-                        m.get("name", "").replace("models/", "")
-                        for m in data.get("models", [])
-                        if "generateContent" in m.get("supportedGenerationMethods", [])
-                    ]
-                    # Nếu tìm thấy mô hình hỗ trợ, gọi ngay mô hình đầu tiên
-                    if models:
-                        target_model = models[0]
-                        post_url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={GEMINI_API_KEY}"
-                        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                        async with session.post(post_url, json=payload, timeout=30) as post_resp:
-                            post_data = await post_resp.json()
-                            candidates = post_data.get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                if parts:
-                                    return parts[0].get("text", "")
-                            return f"Model khả dụng ({target_model}) nhưng lỗi: {post_data}"
-                    else:
-                        return f"Tài khoản không có model generateContent nào. Danh sách gốc: {data}"
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "")
+                    return "Không nhận được nội dung trả lời từ Gemini."
                 else:
-                    return f"Lỗi lấy danh sách models (HTTP {resp.status}): {data}"
+                    err_msg = data.get("error", {}).get("message", str(data))
+                    return f"Lỗi Google ({resp.status}): {err_msg}"
         except Exception as e:
-            return f"Lỗi ngoại lệ: {str(e)}"
-            
-        
+            return f"Lỗi kết nối: {str(e)}"
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_name = update.effective_user.first_name
