@@ -44,31 +44,36 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    """Gọi trực tiếp Google Gemini REST API với mô hình gemini-3.8-flash"""
-    model = "gemini-3.8-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    """Gọi Gemini REST API với cơ chế tự động thử lại và dự phòng khi server quá tải (503)"""
+    models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
 
     async with ClientSession() as session:
-        try:
-            async with session.post(url, json=payload, timeout=30) as resp:
-                data = await resp.json()
-                if resp.status == 200:
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts:
-                            return parts[0].get("text", "")
-                    return "Không nhận được nội dung trả lời từ Gemini."
-                else:
-                    err_msg = data.get("error", {}).get("message", str(data))
-                    logger.error(f"Lỗi API Gemini ({resp.status}): {err_msg}")
-                    return f"Lỗi Google ({resp.status}): {err_msg}"
-        except Exception as e:
-            logger.error(f"Lỗi kết nối Gemini: {e}")
-            return f"Lỗi kết nối mạng: {str(e)}"
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            for retry in range(2):  # Thử lại tối đa 2 lần nếu gặp lỗi 503
+                try:
+                    async with session.post(url, json=payload, timeout=30) as resp:
+                        data = await resp.json()
+                        if resp.status == 200:
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                if parts:
+                                    return parts[0].get("text", "")
+                        elif resp.status == 503:
+                            logger.warning(f"Model {model} quá tải (503), đang thử lại...")
+                            await asyncio.sleep(1.5)
+                            continue
+                        else:
+                            break  # Nếu gặp mã lỗi khác (như 404), chuyển sang model tiếp theo
+                except Exception as e:
+                    logger.error(f"Lỗi kết nối tới {model}: {e}")
+                    break
+
+    return "Máy chủ AI hiện đang chịu tải cao, bạn hãy gửi lại câu hỏi sau vài giây nhé!"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
