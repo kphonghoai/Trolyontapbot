@@ -11,8 +11,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from aiohttp import web
-from google import genai
+from aiohttp import web, ClientSession
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -25,7 +24,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IZTCF3QcO9oNVYnAhs82
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
 
-client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1beta'})
 
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
@@ -46,33 +44,32 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    models_to_try = [
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-        "gemini-flash"
-    ]
+    """Gọi trực tiếp Google Gemini qua REST API tự động dò tìm model khả dụng"""
+    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
     
-    loop = asyncio.get_running_loop()
-    last_error = ""
+    async with ClientSession() as session:
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                async with session.post(url, json=payload, timeout=30) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                return parts[0].get("text", "")
+                    else:
+                        err_msg = data.get("error", {}).get("message", "Lỗi không xác định")
+                        logger.warning(f"Model {model} lỗi ({resp.status}): {err_msg}")
+            except Exception as e:
+                logger.error(f"Lỗi kết nối tới {model}: {e}")
 
-    for model_name in models_to_try:
-        try:
-            response = await loop.run_in_executor(
-                None,
-                lambda m=model_name: client.models.generate_content(
-                    model=m,
-                    contents=prompt,
-                )
-            )
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"Khong the goi model {model_name}: {e}")
-            continue
+    return "Không thể kết nối đến Gemini. Vui lòng kiểm tra lại quyền hạn của khóa API Key."
 
-    return f"Lỗi kết nối Gemini: {last_error[:150]}"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -80,7 +77,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     if chat_id not in data["users"]:
- 
         data["users"][chat_id] = {
             "name": user_name,
             "registered_at": datetime.now(LOCAL_TZ).isoformat(),
@@ -102,8 +98,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/ontap`: Ôn tập nhanh bài gần nhất với câu hỏi Active Recall từ Gemini.\n"
         "• `/list`: Xem danh sách 5 bài gần nhất.\n"
         "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>`: Tùy chỉnh giờ nhắc nhở theo ý muốn.\n"
-        f"  *(Lịch hiện tại của bạn: Sáng {user_schedule.get('morning', '10:00')} | Tối {user_schedule.get('evening', '19:30')} | Nhắc {user_schedule.get('night', '22:00')})*\n\n"
-        "💡 Bạn có thể trò chuyện tự do với tôi bất cứ lúc nào mà không sợ bị lưu nhầm bài học!"
+        f"  *(Lịch hiện tại: Sáng {user_schedule.get('morning', '10:00')} | Tối {user_schedule.get('evening', '19:30')} | Nhắc {user_schedule.get('night', '22:00')})*\n\n"
+        "💡 Bạn có thể trò chuyện tự do với tôi bất cứ lúc nào!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -114,9 +110,7 @@ async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not args or len(args) != 3:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập đủ 3 khung giờ theo định dạng HH:MM.\n\n"
-            "Ví dụ:\n`/settime 09:00 20:00 22:30`\n"
-            "(Trong đó: 09:00 là ôn sáng, 20:00 là ôn tối, 22:30 là nhắc gửi bài)",
+            "⚠️ Vui lòng nhập đủ 3 khung giờ theo định dạng HH:MM.\nVí dụ:\n`/settime 09:00 20:00 22:30`",
             parse_mode="Markdown",
         )
         return
@@ -152,10 +146,10 @@ async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
 
     await update.message.reply_text(
-        f"✅ **Đã cập nhật lịch nhắc mới thành công!**\n\n"
-        f"☀️ Ôn tập Active Recall sáng: **{m_time}**\n"
-        f"🎯 Ôn tập tình huống thực tế tối: **{e_time}**\n"
-        f"🌙 Nhắc gửi kiến thức mới: **{n_time}**",
+        f"✅ **Đã cập nhật lịch nhắc mới!**\n\n"
+        f"☀️ Sáng: **{m_time}**\n"
+        f"🎯 Tối: **{e_time}**\n"
+        f"🌙 Nhắc bài: **{n_time}**",
         parse_mode="Markdown",
     )
 
@@ -167,8 +161,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not content:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\n"
-            "Ví dụ:\n`/save Quy trình xuất nhập tồn kho bước 1 kiểm tra đơn...`",
+            "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\nVí dụ:\n`/save Quy trình tiếp nhận đơn hàng...`",
             parse_mode="Markdown",
         )
         return
@@ -194,7 +187,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     confirm_text = (
         "✅ **Đã ghi nhận kiến thức thành công!**\n\n"
         f"📝 *Nội dung:*\n{content}\n\n"
-        "🎯 Trợ lý sẽ tự động nhắc bạn theo lịch hẹn đã cài đặt. Bạn cũng có thể dùng `/ontap` để ôn lại bất cứ lúc nào."
+        "🎯 Trợ lý sẽ tự động nhắc bạn theo lịch hẹn. Bạn có thể dùng `/ontap` để ôn lại bất cứ lúc nào."
     )
     await update.message.reply_text(confirm_text, parse_mode="Markdown")
 
@@ -211,13 +204,11 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     latest_note = user_info["notes"][-1]
-    await update.message.reply_text("🤖 Gemini đang soạn câu hỏi gợi nhớ cho bạn...")
+    await update.message.reply_text("🤖 Gemini đang soạn câu hỏi gợi nhớ...")
 
     prompt = (
-        f"Dưới đây là ghi chú học tập của người dùng: '{latest_note['content']}'.\n"
-        "Hãy đóng vai trợ lý ôn tập thông minh theo phương pháp gợi nhớ chủ động (Active Recall). "
-        "Tóm tắt 1 câu ngắn gọn, sau đó đặt 2 câu hỏi tình huống hoặc kiểm tra trí nhớ để họ tự suy ngẫm. "
-        "Lời văn thân thiện, súc tích bằng tiếng Việt."
+        f"Dưới đây là ghi chú: '{latest_note['content']}'.\n"
+        "Đóng vai trợ lý học tập Active Recall: Tóm tắt 1 câu ngắn, sau đó đặt 2 câu hỏi tình huống thực tế để kiểm tra trí nhớ. Trả lời bằng tiếng Việt ngắn gọn."
     )
     ai_question = await ask_gemini(prompt)
 
@@ -247,9 +238,8 @@ async def handle_chat_with_gemini(update: Update, context: ContextTypes.DEFAULT_
     await update.message.chat.send_action("typing")
 
     prompt = (
-        f"Người dùng vừa nhắn: '{user_text}'.\n"
-        "Bạn là trợ lý học tập cá nhân thân thiện. Hãy trả lời câu hỏi của người dùng bằng tiếng Việt ngắn gọn, hữu ích. "
-        "Nếu người dùng có ý định lưu bài học, hãy nhắc họ dùng cú pháp /save <nội dung>."
+        f"Người dùng nhắn: '{user_text}'.\n"
+        "Trả lời bằng tiếng Việt thân thiện, súc tích. Nếu người dùng muốn lưu bài học, nhắc họ dùng cú pháp /save <nội dung>."
     )
     ai_reply = await ask_gemini(prompt)
     await update.message.reply_text(ai_reply)
@@ -269,14 +259,9 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         )
         last_sent = user_data.get("last_sent", {})
 
-        # 1. Nhắc nhở buổi tối
         if current_time_str == schedule.get("night", "22:00"):
             if last_sent.get("night") != today_date_str:
-                msg = (
-                    "🌙 **Đã đến giờ tổng kết ngày rồi!**\n\n"
-                    "Hôm nay bạn học được điều gì hay hoặc xử lý tình huống nào tâm đắc nhất?\n"
-                    "👉 Dùng cú pháp: `/save <nội dung>` để tôi lưu lại và lên lịch ôn tập cho bạn nhé!"
-                )
+                msg = "🌙 **Đến giờ tổng kết ngày!**\nHôm nay bạn học được điều gì mới? Dùng `/save <nội dung>` để lưu nhé!"
                 try:
                     await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="Markdown")
                     last_sent["night"] = today_date_str
@@ -284,39 +269,27 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Lỗi gửi tin nhắc tối: {e}")
 
-        # 2. Ôn tập buổi sáng
         if current_time_str == schedule.get("morning", "10:00"):
             if last_sent.get("morning") != today_date_str:
                 notes = user_data.get("notes", [])
                 if notes:
-                    content = notes[-1]["content"]
-                    prompt = (
-                        f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
-                        "Hãy tạo 1 câu hỏi nhanh Active Recall bằng tiếng Việt để đánh thức trí nhớ buổi sáng."
-                    )
+                    prompt = f"Ghi chú: '{notes[-1]['content']}'. Đặt 1 câu hỏi nhanh Active Recall đánh thức trí nhớ buổi sáng bằng tiếng Việt."
                     ai_q = await ask_gemini(prompt)
-                    msg = f"☀️ **Khởi động trí nhớ buổi sáng (Active Recall)!**\n\n{ai_q}"
                     try:
-                        await context.bot.send_message(chat_id=int(chat_id), text=msg)
+                        await context.bot.send_message(chat_id=int(chat_id), text=f"☀️ **Active Recall sáng:**\n\n{ai_q}")
                         last_sent["morning"] = today_date_str
                         updated = True
                     except Exception as e:
                         logger.error(f"Lỗi gửi tin sáng: {e}")
 
-        # 3. Ôn tập tình huống buổi tối
         if current_time_str == schedule.get("evening", "19:30"):
             if last_sent.get("evening") != today_date_str:
                 notes = user_data.get("notes", [])
                 if notes:
-                    content = notes[-1]["content"]
-                    prompt = (
-                        f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
-                        "Hãy đặt 1 câu hỏi tình huống thực tế chuyên sâu bằng tiếng Việt để người dùng vận dụng kiến thức này."
-                    )
+                    prompt = f"Ghi chú: '{notes[-1]['content']}'. Đặt 1 câu hỏi tình huống thực tế bằng tiếng Việt."
                     ai_q = await ask_gemini(prompt)
-                    msg = f"🎯 **Ôn tập vận dụng thực tế!**\n\n{ai_q}"
                     try:
-                        await context.bot.send_message(chat_id=int(chat_id), text=msg)
+                        await context.bot.send_message(chat_id=int(chat_id), text=f"🎯 **Vận dụng thực tế:**\n\n{ai_q}")
                         last_sent["evening"] = today_date_str
                         updated = True
                     except Exception as e:
@@ -356,7 +329,6 @@ async def run_bot():
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(dynamic_scheduler_job, interval=60, first=10)
-        logger.info("Da kich hoat tien trinh kiem tra lich hen dong!")
 
     await run_web_server()
 
