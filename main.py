@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import asyncio
 from datetime import datetime, time, timezone, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -10,6 +11,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from aiohttp import web
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -48,7 +50,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["users"][chat_id] = {
             "name": user_name,
             "registered_at": datetime.now(LOCAL_TZ).isoformat(),
-            "notes": []
+            "notes": [],
         }
         save_data(data)
 
@@ -74,7 +76,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["users"][chat_id] = {
             "name": update.effective_user.first_name,
             "registered_at": now.isoformat(),
-            "notes": []
+            "notes": [],
         }
 
     new_note = {
@@ -163,7 +165,23 @@ async def job_review_19h30(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Lỗi gửi tin nhắn 19h30: {e}")
 
 
-def main():
+# Web server giả lập để Render quét mở cổng thành công
+async def handle_ping(request):
+    return web.Response(text="Bot Telegram dang hoat dong 24/7!")
+
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Da mo cong web {port} thanh cong cho Render!")
+
+
+async def run_bot():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -175,10 +193,20 @@ def main():
         job_queue.run_daily(job_reminder_22h, time=time(hour=22, minute=0, tzinfo=LOCAL_TZ))
         job_queue.run_daily(job_review_10h, time=time(hour=10, minute=0, tzinfo=LOCAL_TZ))
         job_queue.run_daily(job_review_19h30, time=time(hour=19, minute=30, tzinfo=LOCAL_TZ))
-        print("Đã lên lịch nhắc nhở 10:00, 19:30 và 22:00!")
+        logger.info("Da len lich nhac nho 10:00, 19:30 va 22:00!")
 
-    print("🚀 Bot đang chạy...")
-    application.run_polling()
+    await run_web_server()
+
+    async with application:
+        await application.start()
+        await application.updater.start_polling()
+        logger.info("🚀 Bot dang chay...")
+        while True:
+            await asyncio.sleep(3600)
+
+
+def main():
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
