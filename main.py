@@ -492,11 +492,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_user_container(data["users"], chat_id, user_name)
     save_data(data)
 
+    call_name = "Phong" if "phong" in user_name.lower() or user_name in ["Bạn", "User"] else user_name
     welcome_text = (
-        f"Chào {user_name}! 👋✨ Chúc bạn một ngày tràn đầy năng lượng và niềm vui học tập! 🌟🚀\n\n"
-        "Tôi là **Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh** (Groq AI) — người bạn đồng hành tiếp sức cho hành trình nâng cấp bản thân mỗi ngày của bạn! 📚💡🌱\n\n"
-        "🎯 *Mỗi ngày một điều mới, tích tiểu thành đại cùng nhau nhé! Bạn có thể gửi bài học, file Word, Excel, PDF hoặc ảnh chụp tài liệu bất kỳ lúc nào để tôi cùng bạn đọc và ôn tập!*\n\n"
-        "👉 Gõ lệnh **/help** để mở bảng tra cứu toàn bộ câu lệnh mẫu bất cứ lúc nào. Hôm nay bạn muốn cùng tôi khám phá hoặc ôn tập điều gì nào? Cùng bắt đầu thôi! 🎉🔥"
+        f"Chào {call_name}! 🌟✨ Chúc {call_name} một ngày tràn đầy năng lượng, may mắn và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
+        f"Mình là **Trợ lý Ôn tập & Đồng hành Tri thức** của {call_name} đây! 📚💡 Hôm nay {call_name} đã sẵn sàng cùng mình nạp thêm những kiến thức tuyệt vời nào chưa? Cùng bứt phá thôi! 🎉\n\n"
+        "🎯 *Mỗi ngày tích lũy một chút, sau một năm chắc chắn sẽ tiến bộ vượt bậc! {call_name} có thể gửi bài học, file Word, Excel, PDF hoặc ảnh chụp tài liệu bất cứ lúc nào để mình cùng đọc và ôn tập nhé!*\n\n"
+        f"👉 Gõ lệnh **/help** để mở bảng tra cứu toàn bộ câu lệnh mẫu bất cứ lúc nào. Hôm nay {call_name} muốn cùng mình khám phá điều gì nào? Cùng bắt đầu thôi! 🎉🔥"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
@@ -555,12 +556,35 @@ async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
+    raw_name = update.effective_user.first_name or "Phong"
+    call_name = "Phong" if "phong" in raw_name.lower() or raw_name in ["Bạn", "User"] else raw_name
+
+    # Xử lý các câu chào hỏi trực tiếp bằng câu chào siêu năng lượng có tên Phong
+    greetings = ["hi", "hello", "xin chào", "chào", "chao", "alo", "start", "/start", "helo", "hey"]
+    lower_text = user_text.lower()
+    if lower_text in greetings or any(lower_text.startswith(g) for g in ["chào bot", "xin chào bot", "hi bot", "chào bạn"]):
+        reply = (
+            f"Chào {call_name}! 🌟✨ Chúc {call_name} một ngày tràn đầy năng lượng, may mắn và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
+            f"Mình là **Trợ lý Ôn tập & Đồng hành Tri thức** của {call_name} đây! 📚💡 Hôm nay {call_name} đã sẵn sàng cùng mình nạp thêm những kiến thức tuyệt vời nào chưa? Cùng bứt phá thôi! 🎉\n\n"
+            "👉 Bất cứ lúc nào cần hỗ trợ:\n"
+            "• Gõ `/help` để xem bảng tra cứu các câu lệnh tiện ích.\n"
+            "• Gõ `/save <nội dung>` hoặc gửi file Word, Excel, PDF, ảnh tài liệu vào đây là mình sẽ đọc và lên lịch nhắc ôn cho bạn ngay!\n\n"
+            f"Hôm nay {call_name} muốn khám phá chủ đề gì nào? Mình đang rất hào hứng lắng nghe đây! 🥰✨"
+        )
+        await update.message.reply_text(reply, parse_mode="Markdown")
+        return
+
     await update.message.chat.send_action("typing")
 
     prompt = (
-        f"Người dùng nhắn: '{user_text}'.\n"
-        "Trả lời bằng tiếng Việt thân thiện, súc tích. Nếu người dùng muốn lưu bài học, "
-        "hãy hướng dẫn họ dùng lệnh /save <chu_kỳ> <nội dung> hoặc gửi file tài liệu (Word, Excel, PDF, Ảnh)."
+        f"Bạn là người bạn trợ lý học tập thân thiết, tràn đầy nhiệt huyết và năng lượng tích cực của anh {call_name}.\n"
+        f"Người dùng trò chuyện với bạn tên là {call_name}.\n"
+        f"YÊU CẦU QUAN TRỌNG VỀ XƯNG HÔ:\n"
+        f"- Luôn gọi tên '{call_name}' một cách gần gũi, ấm áp, thân thiện (ví dụ: 'Chào {call_name}!', '{call_name} ơi...', 'Chúc {call_name} một ngày tràn đầy năng lượng!').\n"
+        f"- Tuyệt đối KHÔNG BAO GIỜ xưng hô cứng nhắc, xa cách là 'Chào bạn' hay 'bạn' nếu chưa kèm tên {call_name}.\n"
+        f"- Sử dụng các emoji vui tươi, truyền cảm hứng (🌟, 🚀, 💡, 🔥, ✨, 🥰, 🎉).\n"
+        f"- Trả lời bằng tiếng Việt tự nhiên, súc tích, truyền động lực học tập và hướng dẫn lưu bài nếu cần.\n\n"
+        f"Tin nhắn của {call_name}: '{user_text}'"
     )
     ai_reply = await ask_ai(prompt)
     await update.message.reply_text(ai_reply)
@@ -791,8 +815,13 @@ async def dispatch_lark_event(open_id: str, message: dict):
         save_data(data)
     else:
         prompt = (
-            f"Người dùng nhắn: '{raw}'.\n"
-            "Trả lời bằng tiếng Việt thân thiện, súc tích. Hướng dẫn họ gửi bài học hoặc gửi file tài liệu (Word, Excel, PDF, Ảnh)."
+            f"Bạn là người bạn trợ lý học tập thân thiết, tràn đầy nhiệt huyết và năng lượng tích cực của anh Phong.\n"
+            f"YÊU CẦU QUAN TRỌNG VỀ XƯNG HÔ:\n"
+            f"- Luôn gọi tên 'Phong' hoặc 'anh Phong' một cách gần gũi, ấm áp, thân thiện (ví dụ: 'Chào Phong!', 'Phong ơi...').\n"
+            f"- Tuyệt đối KHÔNG BAO GIỜ xưng hô cứng nhắc là 'Chào bạn'.\n"
+            f"- Sử dụng các emoji vui tươi, truyền cảm hứng (🌟, 🚀, 💡, 🔥, ✨, 🥰, 🎉).\n"
+            f"- Trả lời bằng tiếng Việt tự nhiên, súc tích, truyền động lực học tập.\n\n"
+            f"Tin nhắn của Phong: '{raw}'"
         )
         reply = await ask_ai(prompt)
 
