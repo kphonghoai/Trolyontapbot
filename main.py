@@ -49,7 +49,7 @@ def save_data(data: dict):
 def ask_gemini(prompt: str) -> str:
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             contents=prompt,
         )
         return response.text
@@ -200,7 +200,7 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Dưới đây là ghi chú học tập của người dùng: '{latest_note['content']}'.\n"
         "Hãy đóng vai trợ lý ôn tập thông minh theo phương pháp gợi nhớ chủ động (Active Recall). "
         "Tóm tắt 1 câu ngắn gọn, sau đó đặt 2 câu hỏi tình huống hoặc kiểm tra trí nhớ để họ tự suy ngẫm. "
-        "Lời văn thân thiện, súc tích."
+        "Lời văn thân thiện, súc tích bằng tiếng Việt."
     )
     ai_question = ask_gemini(prompt)
 
@@ -231,7 +231,7 @@ async def handle_chat_with_gemini(update: Update, context: ContextTypes.DEFAULT_
 
     prompt = (
         f"Người dùng vừa nhắn: '{user_text}'.\n"
-        "Bạn là trợ lý học tập cá nhân thân thiện. Hãy trả lời câu hỏi của người dùng ngắn gọn, hữu ích. "
+        "Bạn là trợ lý học tập cá nhân thân thiện. Hãy trả lời câu hỏi của người dùng bằng tiếng Việt ngắn gọn, hữu ích. "
         "Nếu người dùng có ý định lưu bài học, hãy nhắc họ dùng cú pháp /save <nội dung>."
     )
     ai_reply = ask_gemini(prompt)
@@ -275,7 +275,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     content = notes[-1]["content"]
                     prompt = (
                         f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
-                        "Hãy tạo 1 câu hỏi nhanh Active Recall để đánh thức trí nhớ buổi sáng."
+                        "Hãy tạo 1 câu hỏi nhanh Active Recall bằng tiếng Việt để đánh thức trí nhớ buổi sáng."
                     )
                     ai_q = ask_gemini(prompt)
                     msg = f"☀️ **Khởi động trí nhớ buổi sáng (Active Recall)!**\n\n{ai_q}"
@@ -294,7 +294,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     content = notes[-1]["content"]
                     prompt = (
                         f"Kiến thức người dùng đã ghi lại: '{content}'.\n"
-                        "Hãy đặt 1 câu hỏi tình huống thực tế chuyên sâu để người dùng vận dụng kiến thức này."
+                        "Hãy đặt 1 câu hỏi tình huống thực tế chuyên sâu bằng tiếng Việt để người dùng vận dụng kiến thức này."
                     )
                     ai_q = ask_gemini(prompt)
                     msg = f"🎯 **Ôn tập vận dụng thực tế!**\n\n{ai_q}"
@@ -357,3 +357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
