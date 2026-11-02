@@ -42,7 +42,8 @@ def save_data(data: dict):
     except Exception as e:
         logger.error(f"Lỗi ghi file: {e}")
 
-    async def ask_gemini(prompt: str) -> str:
+
+async def ask_gemini(prompt: str) -> str:
     """Gọi trực tiếp Google Gemini REST API với mô hình gemini-3.8-flash"""
     model = "gemini-3.8-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -68,7 +69,8 @@ def save_data(data: dict):
         except Exception as e:
             logger.error(f"Lỗi kết nối Gemini: {e}")
             return f"Lỗi kết nối mạng: {str(e)}"
-            
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_name = update.effective_user.first_name
@@ -344,4 +346,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
