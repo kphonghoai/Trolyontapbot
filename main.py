@@ -42,14 +42,13 @@ def save_data(data: dict):
     except Exception as e:
         logger.error(f"Lỗi ghi file: {e}")
 
-
 async def ask_gemini(prompt: str) -> str:
-    """Gọi trực tiếp Gemini qua REST API tự động dò tìm mô hình khả dụng"""
     models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
     
+    last_err_detail = ""
     async with ClientSession() as session:
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -63,14 +62,13 @@ async def ask_gemini(prompt: str) -> str:
                             if parts:
                                 return parts[0].get("text", "")
                     else:
-                        err_msg = data.get("error", {}).get("message", "Lỗi")
-                        logger.warning(f"Model {model} ({resp.status}): {err_msg}")
+                        err_obj = data.get("error", {})
+                        last_err_detail = f"[{model} - HTTP {resp.status}]: {err_obj.get('message', data)}"
             except Exception as e:
-                logger.error(f"Lỗi kết nối tới {model}: {e}")
+                last_err_detail = f"[{model} Exception]: {str(e)}"
 
-    return "Không thể nhận phản hồi từ Gemini. Vui lòng thử lại sau giây lát."
-
-
+    return f"Lỗi chi tiết từ Google:\n{last_err_detail}"
+        
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_name = update.effective_user.first_name
