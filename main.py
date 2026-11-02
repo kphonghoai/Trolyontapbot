@@ -84,75 +84,55 @@ def save_data(data: dict):
 # --- KẾT NỐI GROQ AI (VĂN BẢN & VISION HÌNH ẢNH) ---
 
 async def ask_ai(prompt: str) -> str:
-    """Tự động truy vấn model văn bản khả dụng trên Groq và trả lời."""
+    """Truy vấn Groq AI với các model văn bản chuẩn (Llama 3.3 / Llama 3.1) không lỗi điều khoản."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    # Danh sách các model chính thức, hoàn toàn mở và ổn định nhất trên Groq
+    candidate_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "gemma2-9b-it",
+        "mixtral-8x7b-32768",
+    ]
 
     async with ClientSession() as session:
-        active_model = "llama-3.1-8b-instant"
-        try:
-            async with session.get(
-                "https://api.groq.com/openai/v1/models", headers=headers, timeout=10
-            ) as m_resp:
-                if m_resp.status == 200:
-                    m_data = await m_resp.json()
-                    model_list = [
-                        m["id"]
-                        for m in m_data.get("data", [])
-                        if "whisper" not in m["id"]
-                    ]
-                    for preferred in [
-                        "llama-3.3-70b-versatile",
-                        "llama-3.1-8b-instant",
-                        "llama3-70b-8192",
-                        "llama3-8b-8192",
-                        "gemma2-9b-it",
-                        "mixtral-8x7b-32768",
-                    ]:
-                        if preferred in model_list:
-                            active_model = preferred
-                            break
+        for model in candidate_models:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. "
+                            "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, gợi mở tư duy thực tế."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.6,
+            }
+
+            try:
+                async with session.post(
+                    url, json=payload, headers=headers, timeout=25
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        choices = data.get("choices", [])
+                        if choices:
+                            return choices[0].get("message", {}).get("content", "").strip()
                     else:
-                        if model_list:
-                            active_model = model_list[0]
-        except Exception as e:
-            logger.warning(f"Không thể lấy danh sách model động: {e}")
+                        data = await resp.json()
+                        err_msg = data.get("error", {}).get("message", "")
+                        logger.warning(f"Model {model} lỗi ({resp.status}): {err_msg}. Đang chuyển sang model tiếp theo...")
+            except Exception as e:
+                logger.warning(f"Lỗi kết nối tới model {model}: {e}")
 
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        payload = {
-            "model": active_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. "
-                        "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, gợi mở tư duy thực tế."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.6,
-        }
-
-        try:
-            async with session.post(
-                url, json=payload, headers=headers, timeout=30
-            ) as resp:
-                data = await resp.json()
-                if resp.status == 200:
-                    choices = data.get("choices", [])
-                    if choices:
-                        return choices[0].get("message", {}).get("content", "").strip()
-                    return "Không nhận được phản hồi từ AI."
-                else:
-                    err_msg = data.get("error", {}).get("message", str(data))
-                    logger.error(f"Lỗi Groq ({resp.status}): {err_msg}")
-                    return f"Lỗi Groq ({resp.status}) với model [{active_model}]: {err_msg}"
-        except Exception as e:
-            logger.error(f"Lỗi kết nối Groq: {e}")
-            return f"Lỗi kết nối mạng: {str(e)}"
+        return "⚠️ Không thể kết nối tới các model AI của Groq. Vui lòng kiểm tra lại kết nối mạng hoặc API Key."
 
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
