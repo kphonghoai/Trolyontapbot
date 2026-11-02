@@ -44,7 +44,7 @@ def save_data(data: dict):
 
     async def ask_gemini(prompt: str) -> str:
     """Gọi trực tiếp mô hình gemini-3.8-flash theo yêu cầu mới nhất của Google"""
-    model = "gemini-3.8-flash"
+    model = "gemini-flash-latest"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
