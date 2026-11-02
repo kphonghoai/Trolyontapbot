@@ -18,13 +18,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# CẤU HÌNH TOKEN VÀ KHÓA API
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
-
-# DANH SÁCH 2 KHÓA API GEMINI TỰ ĐỘNG DỰ PHÒNG
-GEMINI_API_KEYS = [
-    os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JKXn4QK86_jTBWE6ogqNTf_txh8jiYMvBZcjscHGB8QA"),
-    "AQ.Ab8RN6KApSH2yUbh2qpaCW8-BF4kt2Le6UIUNwScWYp5LzudWg"
-]
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-a99ff35bc29849f99f955d00717f09a6")
 
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
@@ -48,43 +44,47 @@ def save_data(data: dict):
         logger.error(f"Lỗi ghi file: {e}")
 
 
-async def ask_gemini(prompt: str) -> str:
-    """Gọi Gemini REST API luân chuyển qua 2 API Key và 3 Model để chống nghẽn hoàn toàn"""
-    models = [
-        "gemini-3.8-flash-lite",
-        "gemini-3.8-flash",
-        "gemini-3.8-pro"
-    ]
+async def ask_ai(prompt: str) -> str:
+    """Gọi DeepSeek REST API (mô hình deepseek-chat)"""
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
+        "model": "deepseek-chat",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, rõ ràng."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7
     }
 
     async with ClientSession() as session:
-        for api_key in GEMINI_API_KEYS:
-            for model in models:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-                for retry in range(2):
-                    try:
-                        async with session.post(url, json=payload, timeout=25) as resp:
-                            data = await resp.json()
-                            if resp.status == 200:
-                                candidates = data.get("candidates", [])
-                                if candidates:
-                                    parts = candidates[0].get("content", {}).get("parts", [])
-                                    if parts:
-                                        return parts[0].get("text", "")
-                            elif resp.status in [503, 429]:
-                                logger.warning(f"Key ...{api_key[-6:]} | Model {model} chịu tải ({resp.status}). Đang thử lại/chuyển luồng...")
-                                await asyncio.sleep(1)
-                                continue
-                            else:
-                                logger.warning(f"Model {model} báo mã {resp.status}: {data.get('error', {}).get('message')}")
-                                break
-                    except Exception as e:
-                        logger.error(f"Lỗi kết nối tới {model}: {e}")
-                        break
+        for retry in range(2):
+            try:
+                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        choices = data.get("choices", [])
+                        if choices:
+                            return choices[0].get("message", {}).get("content", "").strip()
+                        return "Không nhận được nội dung trả lời từ AI."
+                    else:
+                        err_msg = data.get("error", {}).get("message", str(data))
+                        logger.error(f"Lỗi DeepSeek ({resp.status}): {err_msg}")
+                        if resp.status in [500, 502, 503, 429]:
+                            await asyncio.sleep(1.5)
+                            continue
+                        return f"Lỗi máy chủ AI ({resp.status}): {err_msg}"
+            except Exception as e:
+                logger.error(f"Lỗi kết nối DeepSeek: {e}")
+                await asyncio.sleep(1)
 
-    return "Máy chủ AI hiện đang chịu tải cao trên toàn bộ các kênh dự phòng, bạn vui lòng gửi lại sau vài giây nhé!"
+    return "Máy chủ AI hiện đang bận, bạn vui lòng gửi lại câu hỏi sau vài giây nhé!"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,10 +108,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"Chào {user_name}! 👋\n\n"
-        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp Gemini AI đa luồng dự phòng.\n\n"
+        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp **DeepSeek AI** siêu tốc.\n\n"
         "📌 **Các lệnh điều khiển:**\n"
         "• `/save <nội dung>`: Lưu kiến thức mới học.\n"
-        "• `/ontap`: Ôn tập nhanh bài gần nhất với câu hỏi Active Recall từ Gemini.\n"
+        "• `/ontap`: Ôn tập bài gần nhất với câu hỏi Active Recall từ AI.\n"
         "• `/list`: Xem danh sách 5 bài gần nhất.\n"
         "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>`: Tùy chỉnh giờ nhắc nhở theo ý muốn.\n"
         f"  *(Lịch hiện tại: Sáng {user_schedule.get('morning', '10:00')} | Tối {user_schedule.get('evening', '19:30')} | Nhắc {user_schedule.get('night', '22:00')})*\n\n"
@@ -220,13 +220,13 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     latest_note = user_info["notes"][-1]
-    await update.message.reply_text("🤖 Gemini đang soạn câu hỏi gợi nhớ...")
+    await update.message.reply_text("🤖 DeepSeek đang soạn câu hỏi gợi nhớ...")
 
     prompt = (
         f"Dưới đây là ghi chú: '{latest_note['content']}'.\n"
         "Đóng vai trợ lý học tập Active Recall: Tóm tắt 1 câu ngắn, sau đó đặt 2 câu hỏi tình huống thực tế để kiểm tra trí nhớ. Trả lời bằng tiếng Việt ngắn gọn."
     )
-    ai_question = await ask_gemini(prompt)
+    ai_question = await ask_ai(prompt)
 
     msg = f"📚 **Ôn tập bài lưu ngày {latest_note['date']}:**\n\n{ai_question}"
     await update.message.reply_text(msg)
@@ -257,7 +257,7 @@ async def handle_chat_with_gemini(update: Update, context: ContextTypes.DEFAULT_
         f"Người dùng nhắn: '{user_text}'.\n"
         "Trả lời bằng tiếng Việt thân thiện, súc tích. Nếu người dùng muốn lưu bài học, nhắc họ dùng cú pháp /save <nội dung>."
     )
-    ai_reply = await ask_gemini(prompt)
+    ai_reply = await ask_ai(prompt)
     await update.message.reply_text(ai_reply)
 
 
@@ -290,7 +290,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                 notes = user_data.get("notes", [])
                 if notes:
                     prompt = f"Ghi chú: '{notes[-1]['content']}'. Đặt 1 câu hỏi nhanh Active Recall đánh thức trí nhớ buổi sáng bằng tiếng Việt."
-                    ai_q = await ask_gemini(prompt)
+                    ai_q = await ask_ai(prompt)
                     try:
                         await context.bot.send_message(chat_id=int(chat_id), text=f"☀️ **Active Recall sáng:**\n\n{ai_q}")
                         last_sent["morning"] = today_date_str
@@ -303,7 +303,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                 notes = user_data.get("notes", [])
                 if notes:
                     prompt = f"Ghi chú: '{notes[-1]['content']}'. Đặt 1 câu hỏi tình huống thực tế bằng tiếng Việt."
-                    ai_q = await ask_gemini(prompt)
+                    ai_q = await ask_ai(prompt)
                     try:
                         await context.bot.send_message(chat_id=int(chat_id), text=f"🎯 **Vận dụng thực tế:**\n\n{ai_q}")
                         last_sent["evening"] = today_date_str
