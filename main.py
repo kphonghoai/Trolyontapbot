@@ -18,9 +18,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CẤU HÌNH TOKEN VÀ KHÓA GROQ API
+# CẤU HÌNH TOKEN & KHÓA API
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+
+# KHÓA CỦA LARK SUITE (Điền App ID và App Secret của bạn vào đây)
+LARK_APP_ID = os.environ.get("LARK_APP_ID", "cli_DAN_APP_ID_CUA_BAN_VAO_DAY")
+LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET", "DAN_APP_SECRET_CUA_BAN_VAO_DAY")
 
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
@@ -45,7 +49,7 @@ def save_data(data: dict):
 
 
 async def ask_ai(prompt: str) -> str:
-    """Tự động truy vấn danh sách model khả dụng trên tài khoản Groq và trả lời"""
+    """Tự động truy vấn model Groq và xử lý câu trả lời"""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -58,7 +62,7 @@ async def ask_ai(prompt: str) -> str:
                 if m_resp.status == 200:
                     m_data = await m_resp.json()
                     model_list = [m["id"] for m in m_data.get("data", []) if "whisper" not in m["id"]]
-                    for preferred in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it", "mixtral-8x7b-32768"]:
+                    for preferred in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "gemma2-9b-it"]:
                         if preferred in model_list:
                             active_model = preferred
                             break
@@ -98,6 +102,10 @@ async def ask_ai(prompt: str) -> str:
             return f"Lỗi kết nối mạng: {str(e)}"
 
 
+# =====================================================================
+# BỘ XỬ LÝ LÔ-GÍC CHUNG (DÙNG CHO CẢ TELEGRAM VÀ LARK SUITE)
+# =====================================================================
+
 HELP_MESSAGE = (
     "📖 **BẢNG TRA CỨU CÂU LỆNH MẪU**\n\n"
     "📝 **1. LƯU BÀI HỌC VÀ CHU KỲ NHẮC:**\n"
@@ -124,362 +132,345 @@ HELP_MESSAGE = (
 )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Hiển thị bảng danh sách các câu lệnh mẫu"""
-    await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user_name = update.effective_user.first_name
-
+def process_user_action(user_key: str, user_name: str, text: str) -> str:
+    """Xử lý lệnh và trả về chuỗi phản hồi (dùng chung cho Telegram & Lark)"""
+    text = text.strip()
     data = load_data()
-    if chat_id not in data["users"]:
-        data["users"][chat_id] = {
+    now = datetime.now(LOCAL_TZ)
+
+    if user_key not in data["users"]:
+        data["users"][user_key] = {
             "name": user_name,
-            "registered_at": datetime.now(LOCAL_TZ).isoformat(),
+            "registered_at": now.isoformat(),
             "notes": [],
             "schedule": {"morning": "10:00", "evening": "19:30", "night": "22:00"},
             "last_sent": {},
         }
         save_data(data)
 
-    welcome_text = (
-        f"Chào {user_name}! 👋\n\n"
-        "Tôi là **Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh** (Groq AI).\n\n"
-        "Gõ lệnh **/help** để mở bảng tra cứu toàn bộ câu lệnh mẫu bất cứ lúc nào."
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    parts = text.split()
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1:]
+
+    if cmd in ["/start", "/help", "/lenh"]:
+        return HELP_MESSAGE
+
+    if cmd == "/save":
+        if not args:
+            return "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\nVí dụ: `/save 3ngay Quy trình giao nhận`"
+
+        mode_map = {
+            "hangngay": "hangngay",
+            "trongngay": "trongngay",
+            "homsau": "1ngay",
+            "ngayhomsau": "1ngay",
+            "1ngay": "1ngay",
+            "ketiep": "2ngay",
+            "ngayketiep": "2ngay",
+            "2ngay": "2ngay",
+            "3ngay": "3ngay",
+            "7ngay": "7ngay"
+        }
+        first_arg = args[0].lower().replace("-", "").replace("_", "")
+        if first_arg in mode_map:
+            cycle = mode_map[first_arg]
+            content = " ".join(args[1:]).strip()
+        else:
+            cycle = "hangngay"
+            content = " ".join(args).strip()
+
+        if not content:
+            return "⚠️ Bạn chưa điền nội dung cần lưu!"
+
+        today_date = now.date()
+        target_date = today_date
+        cycle_label = "Hằng ngày"
+
+        if cycle == "trongngay":
+            target_date = today_date
+            cycle_label = "Trong ngày hôm nay"
+        elif cycle == "1ngay":
+            target_date = today_date + timedelta(days=1)
+            cycle_label = "Ngày hôm sau (sau 1 ngày)"
+        elif cycle == "2ngay":
+            target_date = today_date + timedelta(days=2)
+            cycle_label = "Ngày kế tiếp (sau 2 ngày)"
+        elif cycle == "3ngay":
+            target_date = today_date + timedelta(days=3)
+            cycle_label = "Sau 3 ngày"
+        elif cycle == "7ngay":
+            target_date = today_date + timedelta(days=7)
+            cycle_label = "Sau 7 ngày (1 tuần)"
+
+        note_id = len(data["users"][user_key]["notes"]) + 1
+        new_note = {
+            "id": note_id,
+            "date": now.strftime("%Y-%m-%d %H:%M"),
+            "created_date": today_date.isoformat(),
+            "target_date": target_date.isoformat(),
+            "cycle": cycle,
+            "cycle_label": cycle_label,
+            "content": content,
+        }
+        data["users"][user_key]["notes"].append(new_note)
+        save_data(data)
+
+        return (
+            f"✅ Đã ghi nhận kiến thức [Mã #{note_id}]!\n\n"
+            f"📝 Nội dung: {content}\n"
+            f"⏰ Chu kỳ nhắc: {cycle_label}\n"
+            f"📅 Lịch bắt đầu nhắc: {target_date.strftime('%d/%m/%Y')}\n\n"
+            f"💡 Dùng `/ontap {note_id}` để ôn lại bài này."
+        )
+
+    if cmd == "/list":
+        notes = data["users"][user_key].get("notes", [])
+        if not notes:
+            return "Hiện tại bạn chưa lưu bài học nào. Hãy dùng `/save` để bắt đầu!"
+
+        reply = f"📚 Danh sách {len(notes)} bài học đã lưu của bạn:\n\n"
+        for item in notes[-10:]:
+            n_id = item.get("id", "-")
+            c_label = item.get("cycle_label", "Hằng ngày")
+            reply += f"🔹 [#{n_id}] {item['date']} (Chu kỳ: {c_label})\n👉 {item['content'][:120]}...\n(Ôn bài: `/ontap {n_id}`)\n\n"
+        return reply
+
+    if cmd == "/search":
+        keyword = " ".join(args).strip().lower()
+        if not keyword:
+            return "⚠️ Vui lòng nhập từ khóa. Ví dụ: `/search bưu cục`"
+        notes = data["users"][user_key].get("notes", [])
+        matched = [n for n in notes if keyword in n["content"].lower()]
+        if not matched:
+            return f"🔍 Không tìm thấy bài học nào chứa từ khóa: {keyword}"
+        reply = f"🔍 Tìm thấy {len(matched)} bài học:\n\n"
+        for item in matched[:5]:
+            reply += f"📌 [#{item.get('id', '-')}] ({item['date']}):\n{item['content']}\n\n"
+        return reply
+
+    if cmd == "/settime":
+        if len(args) != 3:
+            return "⚠️ Vui lòng nhập đủ 3 khung giờ HH:MM. Ví dụ: `/settime 09:00 19:30 22:00`"
+        data["users"][user_key]["schedule"] = {"morning": args[0], "evening": args[1], "night": args[2]}
+        save_data(data)
+        return f"✅ Đã cập nhật lịch nhắc mới: Sáng {args[0]} | Tối {args[1]} | Đêm {args[2]}"
+
+    return ""
+
+
+# =====================================================================
+# MODULE KẾT NỐI LARK SUITE (LARK OPEN API & WEBHOOK)
+# =====================================================================
+
+async def get_lark_tenant_token(session: ClientSession) -> str:
+    """Lấy access token từ Lark Suite bằng App ID & App Secret"""
+    url = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+    payload = {"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET}
+    try:
+        async with session.post(url, json=payload, timeout=10) as resp:
+            data = await resp.json()
+            return data.get("tenant_access_token", "")
+    except Exception as e:
+        logger.error(f"Lỗi lấy Lark tenant_access_token: {e}")
+        return ""
+
+
+async def send_lark_message(chat_id: str, text: str):
+    """Gửi tin nhắn phản hồi về khung chat trên Lark Suite"""
+    async with ClientSession() as session:
+        token = await get_lark_tenant_token(session)
+        if not token:
+            return
+
+        url = "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=chat_id"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text})
+        }
+        try:
+            async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
+                data = await resp.json()
+                if resp.status != 200 or data.get("code") != 0:
+                    logger.error(f"Lỗi gửi tin Lark: {data}")
+        except Exception as e:
+            logger.error(f"Lỗi kết nối API Lark: {e}")
+
+
+async def handle_lark_webhook(request):
+    """Tiếp nhận và xử lý sự kiện tin nhắn từ Lark Suite"""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(text="Bad Request", status=400)
+
+    # 1. Trả về mã challenge khi cấu hình Event URL lần đầu trên Lark Console
+    if "challenge" in body:
+        return web.json_response({"challenge": body["challenge"]})
+
+    # 2. Xử lý tin nhắn người dùng gửi đến
+    event = body.get("event", {})
+    msg_info = event.get("message", {})
+    sender = event.get("sender", {}).get("sender_id", {})
+    chat_id = msg_info.get("chat_id")
+
+    if chat_id and msg_info.get("message_type") == "text":
+        try:
+            content_json = json.loads(msg_info.get("content", "{}"))
+            user_text = content_json.get("text", "").strip()
+        except Exception:
+            user_text = ""
+
+        if user_text:
+            lark_user_key = f"lark_{sender.get('open_id', chat_id)}"
+            
+            # Xử lý lệnh nhanh (/save, /list, /search, /help...)
+            direct_reply = process_user_action(lark_user_key, "Lark User", user_text)
+            if direct_reply:
+                await send_lark_message(chat_id, direct_reply)
+            elif user_text.startswith("/ontap"):
+                # Ôn tập bằng AI
+                data = load_data()
+                user_notes = data.get("users", {}).get(lark_user_key, {}).get("notes", [])
+                if not user_notes:
+                    await send_lark_message(chat_id, "Bạn chưa lưu bài học nào! Hãy dùng lệnh /save để bắt đầu.")
+                else:
+                    parts = user_text.split()
+                    target_note = user_notes[-1]
+                    if len(parts) > 1:
+                        try:
+                            tid = int(parts[1])
+                            for n in user_notes:
+                                if n.get("id") == tid:
+                                    target_note = n
+                                    break
+                        except ValueError:
+                            pass
+                    ai_q = await ask_ai(f"Kiến thức: '{target_note['content']}'. Đặt 2 câu hỏi Active Recall bằng tiếng Việt.")
+                    await send_lark_message(chat_id, f"📚 Ôn tập bài #{target_note.get('id', '')}:\n\n{ai_q}")
+            else:
+                # Trò chuyện tự do với AI
+                ai_reply = await ask_ai(f"Người dùng nhắn: '{user_text}'. Trả lời bằng tiếng Việt thân thiện, súc tích.")
+                await send_lark_message(chat_id, ai_reply)
+
+    return web.json_response({"code": 0, "msg": "success"})
+
+
+# =====================================================================
+# TELEGRAM HANDLERS
+# =====================================================================
+
+async def tg_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply = process_user_action(str(update.effective_chat.id), update.effective_user.first_name, "/start")
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+async def tg_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
 
+async def tg_save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "/save " + (" ".join(context.args) if context.args else "")
+    reply = process_user_action(str(update.effective_chat.id), update.effective_user.first_name, text)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    args = context.args
+async def tg_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply = process_user_action(str(update.effective_chat.id), update.effective_user.first_name, "/list")
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-    if not args or len(args) != 3:
-        await update.message.reply_text(
-            "⚠️ Vui lòng nhập đủ 3 khung giờ theo định dạng HH:MM.\nVí dụ:\n`/settime 09:00 20:00 22:30`",
-            parse_mode="Markdown",
-        )
-        return
+async def tg_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "/search " + (" ".join(context.args) if context.args else "")
+    reply = process_user_action(str(update.effective_chat.id), update.effective_user.first_name, text)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-    m_time, e_time, n_time = args[0], args[1], args[2]
+async def tg_settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "/settime " + (" ".join(context.args) if context.args else "")
+    reply = process_user_action(str(update.effective_chat.id), update.effective_user.first_name, text)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-    for t_str in [m_time, e_time, n_time]:
-        try:
-            parts = t_str.split(":")
-            h, m = int(parts[0]), int(parts[1])
-            if not (0 <= h <= 23 and 0 <= m <= 59):
-                raise ValueError
-        except Exception:
-            await update.message.reply_text(
-                f"❌ Giờ `{t_str}` không hợp lệ. Vui lòng nhập định dạng 24h từ 00:00 đến 23:59.",
-                parse_mode="Markdown",
-            )
-            return
-
-    data = load_data()
-    if chat_id not in data["users"]:
-        data["users"][chat_id] = {
-            "name": update.effective_user.first_name,
-            "notes": [],
-            "last_sent": {},
-        }
-
-    data["users"][chat_id]["schedule"] = {
-        "morning": m_time,
-        "evening": e_time,
-        "night": n_time,
-    }
-    save_data(data)
-
-    await update.message.reply_text(
-        f"✅ **Đã cập nhật lịch nhắc mới!**\n\n"
-        f"☀️ Sáng: **{m_time}**\n"
-        f"🎯 Tối: **{e_time}**\n"
-        f"🌙 Nhắc bài: **{n_time}**",
-        parse_mode="Markdown",
-    )
-
-
-async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    args = context.args
-    now = datetime.now(LOCAL_TZ)
-
-    if not args:
-        await update.message.reply_text(
-            "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\n"
-            "Cú pháp mẫu: `/save [chu_kỳ] <nội dung>`\n"
-            "Ví dụ:\n`/save 3ngay Quy trình kiểm tra định kỳ bưu cục`\n\n"
-            "💡 Gõ `/help` để xem đầy đủ các tùy chọn chu kỳ.",
-            parse_mode="Markdown",
-        )
-        return
-
-    mode_map = {
-        "hangngay": "hangngay",
-        "trongngay": "trongngay",
-        "homsau": "1ngay",
-        "ngayhomsau": "1ngay",
-        "1ngay": "1ngay",
-        "ketiep": "2ngay",
-        "ngayketiep": "2ngay",
-        "2ngay": "2ngay",
-        "3ngay": "3ngay",
-        "7ngay": "7ngay"
-    }
-
-    first_arg = args[0].lower().replace("-", "").replace("_", "")
-    if first_arg in mode_map:
-        cycle = mode_map[first_arg]
-        content = " ".join(args[1:]).strip()
-    else:
-        cycle = "hangngay"
-        content = " ".join(args).strip()
-
-    if not content:
-        await update.message.reply_text("⚠️ Bạn chưa điền nội dung cần lưu!")
-        return
-
-    today_date = now.date()
-    target_date = today_date
-    cycle_label = "Hằng ngày"
-
-    if cycle == "trongngay":
-        target_date = today_date
-        cycle_label = "Trong ngày hôm nay"
-    elif cycle == "1ngay":
-        target_date = today_date + timedelta(days=1)
-        cycle_label = "Ngày hôm sau (sau 1 ngày)"
-    elif cycle == "2ngay":
-        target_date = today_date + timedelta(days=2)
-        cycle_label = "Ngày kế tiếp (sau 2 ngày)"
-    elif cycle == "3ngay":
-        target_date = today_date + timedelta(days=3)
-        cycle_label = "Sau 3 ngày"
-    elif cycle == "7ngay":
-        target_date = today_date + timedelta(days=7)
-        cycle_label = "Sau 7 ngày (1 tuần)"
-
-    data = load_data()
-    if chat_id not in data["users"]:
-        data["users"][chat_id] = {
-            "name": update.effective_user.first_name,
-            "registered_at": now.isoformat(),
-            "notes": [],
-            "schedule": {"morning": "10:00", "evening": "19:30", "night": "22:00"},
-            "last_sent": {},
-        }
-
-    note_id = len(data["users"][chat_id]["notes"]) + 1
-    new_note = {
-        "id": note_id,
-        "date": now.strftime("%Y-%m-%d %H:%M"),
-        "created_date": today_date.isoformat(),
-        "target_date": target_date.isoformat(),
-        "cycle": cycle,
-        "cycle_label": cycle_label,
-        "content": content,
-    }
-    data["users"][chat_id]["notes"].append(new_note)
-    save_data(data)
-
-    confirm_text = (
-        f"✅ **Đã ghi nhận kiến thức [Mã #{note_id}]!**\n\n"
-        f"📝 *Nội dung:* {content}\n"
-        f"⏰ *Chu kỳ nhắc:* **{cycle_label}**\n"
-        f"📅 *Lịch bắt đầu nhắc:* `{target_date.strftime('%d/%m/%Y')}`\n\n"
-        f"💡 Dùng `/ontap {note_id}` để ôn lại bài này bất cứ lúc nào."
-    )
-    await update.message.reply_text(confirm_text, parse_mode="Markdown")
-
-
-async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tg_ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    user_info = data.get("users", {}).get(chat_id)
-
-    if not user_info or not user_info.get("notes"):
-        await update.message.reply_text(
-            "Bạn chưa lưu bài học nào! Hãy dùng lệnh `/save <nội dung>` để lưu bài đầu tiên."
-        )
+    notes = data.get("users", {}).get(chat_id, {}).get("notes", [])
+    if not notes:
+        await update.message.reply_text("Bạn chưa lưu bài học nào! Hãy dùng lệnh `/save <nội dung>` để lưu bài đầu tiên.")
         return
 
-    notes = user_info["notes"]
-    target_note = None
-
+    target_note = notes[-1]
     if context.args:
         try:
-            target_id = int(context.args[0])
+            tid = int(context.args[0])
             for n in notes:
-                if n.get("id") == target_id:
+                if n.get("id") == tid:
                     target_note = n
                     break
-            if not target_note:
-                await update.message.reply_text(f"❌ Không tìm thấy bài học có mã `#{target_id}`. Dùng `/list` để xem danh sách.")
-                return
         except ValueError:
-            await update.message.reply_text("⚠️ Mã bài học phải là số. Ví dụ: `/ontap 1`")
-            return
-    else:
-        target_note = notes[-1]
+            pass
 
     await update.message.reply_text("🤖 Groq AI đang soạn câu hỏi gợi nhớ...")
+    prompt = f"Kiến thức: '{target_note['content']}'. Đặt 1 câu tóm tắt và 2 câu hỏi tình huống thực tế bằng tiếng Việt."
+    ai_q = await ask_ai(prompt)
+    await update.message.reply_text(f"📚 **Ôn tập bài [#{target_note.get('id', '')}]:**\n\n{ai_q}")
 
-    prompt = (
-        f"Dưới đây là kiến thức đã lưu: '{target_note['content']}'.\n"
-        "Đóng vai trợ lý học tập Active Recall: Hãy tóm tắt 1 câu cốt lõi ngắn, sau đó đặt 2 câu hỏi tình huống thực tế để kiểm tra và khắc sâu trí nhớ. Trả lời bằng tiếng Việt ngắn gọn, gợi mở."
-    )
-    ai_question = await ask_ai(prompt)
-
-    msg = f"📚 **Ôn tập bài [#{target_note.get('id', 'Mới')}] lưu ngày {target_note['date']}:**\n\n{ai_question}"
-    await update.message.reply_text(msg)
-
-
-async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    data = load_data()
-    user_info = data.get("users", {}).get(chat_id)
-
-    if not user_info or not user_info.get("notes"):
-        await update.message.reply_text("Hiện tại bạn chưa lưu bài học nào. Hãy dùng `/save` để bắt đầu!")
-        return
-
-    notes = user_info["notes"]
-    reply = f"📚 **Danh sách {len(notes)} bài học đã lưu của bạn:**\n\n"
-
-    recent_notes = notes[-10:]
-    for item in recent_notes:
-        n_id = item.get("id", "-")
-        c_label = item.get("cycle_label", "Hằng ngày")
-        reply += f"🔹 **[#{n_id}]** `{item['date']}` *(Chu kỳ: {c_label})*\n"
-        reply += f"👉 {item['content'][:120]}...\n"
-        reply += f"*(Ôn bài này: `/ontap {n_id}`)*\n\n"
-
-    if len(notes) > 10:
-        reply += f"💡 *Đang hiển thị 10 bài gần nhất. Dùng `/search <từ khóa>` để tìm bài cũ hơn.*"
-
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    keyword = " ".join(context.args).strip().lower() if context.args else ""
-
-    if not keyword:
-        await update.message.reply_text(
-            "⚠️ Vui lòng nhập từ khóa cần tìm kiếm.\nVí dụ:\n`/search bưu cục` hoặc `/search kpi`",
-            parse_mode="Markdown",
-        )
-        return
-
-    data = load_data()
-    user_info = data.get("users", {}).get(chat_id)
-
-    if not user_info or not user_info.get("notes"):
-        await update.message.reply_text("Kho dữ liệu học tập của bạn hiện đang trống!")
-        return
-
-    matched = [n for n in user_info["notes"] if keyword in n["content"].lower()]
-
-    if not matched:
-        await update.message.reply_text(f"🔍 Không tìm thấy bài học nào chứa từ khóa: **{keyword}**", parse_mode="Markdown")
-        return
-
-    reply = f"🔍 **Tìm thấy {len(matched)} bài học chứa từ khóa '{keyword}':**\n\n"
-    for item in matched[:5]:
-        n_id = item.get("id", "-")
-        reply += f"📌 **[#{n_id}]** `({item['date']})`:\n{item['content']}\n"
-        reply += f"*(Gõ `/ontap {n_id}` để kiểm tra)*\n\n"
-
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
+async def tg_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
-
-    prompt = (
-        f"Người dùng nhắn: '{user_text}'.\n"
-        "Trả lời bằng tiếng Việt thân thiện, súc tích. Nếu người dùng muốn lưu bài học, hãy hướng dẫn họ dùng lệnh /save <chu_kỳ> <nội dung> hoặc gõ /help để xem danh sách lệnh."
-    )
-    ai_reply = await ask_ai(prompt)
+    ai_reply = await ask_ai(f"Người dùng nhắn: '{update.message.text}'. Trả lời bằng tiếng Việt thân thiện, súc tích.")
     await update.message.reply_text(ai_reply)
 
+
+# =====================================================================
+# BỘ NHẮC LỊCH CHỦ ĐỘNG & KHỞI CHẠY HỆ THỐNG
+# =====================================================================
 
 async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
-    today_date = now.date()
-    today_str = today_date.isoformat()
+    today_str = now.date().isoformat()
 
     data = load_data()
     updated = False
 
-    for chat_id, user_data in data.get("users", {}).items():
-        schedule = user_data.get(
-            "schedule", {"morning": "10:00", "evening": "19:30", "night": "22:00"}
-        )
+    for user_key, user_data in data.get("users", {}).items():
+        schedule = user_data.get("schedule", {"morning": "10:00", "evening": "19:30", "night": "22:00"})
         last_sent = user_data.get("last_sent", {})
         notes = user_data.get("notes", [])
 
-        if current_time_str == schedule.get("night", "22:00"):
-            if last_sent.get("night") != today_str:
-                msg = (
-                    "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!**\n\n"
-                    "Hôm nay bạn học được điều gì mới hoặc rút ra kinh nghiệm gì? Hãy dùng lệnh sau để lưu lại nhé:\n"
-                    "`/save [chu_kỳ] <nội dung>`\n"
-                    "*(Ví dụ: `/save 3ngay Quy trình giao nhận hàng lỗi`)*\n\n"
-                    "💡 Gõ `/help` để xem bảng câu lệnh."
-                )
-                try:
-                    await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="Markdown")
-                    last_sent["night"] = today_str
-                    updated = True
-                except Exception as e:
-                    logger.error(f"Lỗi gửi tin nhắc đêm: {e}")
-
+        is_night = (current_time_str == schedule.get("night", "22:00")) and (last_sent.get("night") != today_str)
         is_morning = (current_time_str == schedule.get("morning", "10:00")) and (last_sent.get("morning") != today_str)
         is_evening = (current_time_str == schedule.get("evening", "19:30")) and (last_sent.get("evening") != today_str)
 
-        if is_morning or is_evening:
-            due_notes = []
-            for n in notes:
-                cycle = n.get("cycle", "hangngay")
-                t_date_str = n.get("target_date")
-                
-                if cycle == "hangngay":
-                    due_notes.append(n)
-                elif t_date_str and t_date_str == today_str:
-                    due_notes.append(n)
-
+        msg_to_send = ""
+        if is_night:
+            msg_to_send = "🌙 **Đến giờ tổng kết!** Hôm nay bạn học được điều gì mới? Dùng `/save [chu_kỳ] <nội dung>` để lưu nhé!"
+            last_sent["night"] = today_str
+            updated = True
+        elif is_morning or is_evening:
+            due_notes = [n for n in notes if n.get("cycle") == "hangngay" or n.get("target_date") == today_str]
             if due_notes:
-                selected_note = due_notes[-1]
-                session_type = "buổi sáng" if is_morning else "thực chiến buổi tối"
-                prompt = (
-                    f"Ghi chú đã học: '{selected_note['content']}'.\n"
-                    f"Hãy đặt 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_type} bằng tiếng Việt để giúp người học nhớ lâu."
-                )
+                sel = due_notes[-1]
+                prompt = f"Ghi chú: '{sel['content']}'. Đặt 1 câu hỏi Active Recall kiểm tra trí nhớ bằng tiếng Việt."
                 ai_q = await ask_ai(prompt)
-                
-                title = "☀️ **Active Recall Sáng Nay:**" if is_morning else "🎯 **Tình Huống Vận Dụng Tối Nay:**"
-                msg_body = (
-                    f"{title}\n\n"
-                    f"📖 *Bài học #{selected_note.get('id', '')}:* {selected_note['content'][:100]}...\n\n"
-                    f"{ai_q}\n\n"
-                    f"💡 *(Gõ `/ontap {selected_note.get('id', '')}` để xem giải nghĩa đầy đủ)*"
-                )
+                header = "☀️ **Active Recall Sáng Nay:**" if is_morning else "🎯 **Vận Dụng Tối Nay:**"
+                msg_to_send = f"{header}\n\n📖 *Bài học #{sel.get('id', '')}:* {sel['content'][:100]}...\n\n{ai_q}"
+                if is_morning:
+                    last_sent["morning"] = today_str
+                if is_evening:
+                    last_sent["evening"] = today_str
+                updated = True
+
+        if msg_to_send:
+            if user_key.startswith("lark_"):
+                # Gửi nhắc nhở qua Lark
+                lark_chat_id = user_key.replace("lark_", "")
+                await send_lark_message(lark_chat_id, msg_to_send)
+            else:
+                # Gửi nhắc nhở qua Telegram
                 try:
-                    await context.bot.send_message(chat_id=int(chat_id), text=msg_body, parse_mode="Markdown")
-                    if is_morning:
-                        last_sent["morning"] = today_str
-                    if is_evening:
-                        last_sent["evening"] = today_str
-                    updated = True
+                    await context.bot.send_message(chat_id=int(user_key), text=msg_to_send, parse_mode="Markdown")
                 except Exception as e:
-                    logger.error(f"Lỗi gửi tin nhắc định kỳ: {e}")
+                    logger.error(f"Lỗi gửi tin nhắc Telegram: {e}")
 
         user_data["last_sent"] = last_sent
 
@@ -487,55 +478,33 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
 
-async def handle_ping(request):
-    return web.Response(text="Bot Telegram Tro Ly On Tap dang hoat dong 24/7!")
-
-
 async def run_web_server():
     app = web.Application()
-    app.router.add_get("/", handle_ping)
+    app.router.add_get("/", lambda req: web.Response(text="Bot Telegram & Lark dang hoat dong 24/7!"))
+    app.router.add_post("/webhook/lark", handle_lark_webhook)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Đã mở cổng {port} trên Render thành công!")
-
-
-async def setup_bot_commands(application):
-    """Tự động thiết lập danh sách lệnh hiển thị trên thanh gõ Telegram"""
-    commands = [
-        BotCommand("help", "Bảng tra cứu toàn bộ câu lệnh mẫu"),
-        BotCommand("save", "Lưu bài học theo chu kỳ (homsau, 2ngay, 3ngay...)"),
-        BotCommand("ontap", "Ôn tập kiến thức với AI (hoặc /ontap <id>)"),
-        BotCommand("list", "Xem danh sách bài học đã lưu"),
-        BotCommand("search", "Tìm kiếm bài học cũ theo từ khóa"),
-        BotCommand("settime", "Cài đặt 3 khung giờ nhắc (sáng, tối, đêm)"),
-    ]
-    try:
-        await application.bot.set_my_commands(commands)
-        logger.info("Đã cập nhật danh sách lệnh trên thanh menu Telegram thành công!")
-    except Exception as e:
-        logger.error(f"Lỗi cấu hình bot commands: {e}")
+    logger.info(f"Đã mở cổng {port} trên Render (kèm endpoint /webhook/lark) thành công!")
 
 
 async def run_bot():
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
-        .post_init(setup_bot_commands)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("lenh", help_command))
-    application.add_handler(CommandHandler("save", save_command))
-    application.add_handler(CommandHandler("ontap", ontap_command))
-    application.add_handler(CommandHandler("list", list_notes_command))
-    application.add_handler(CommandHandler("search", search_notes_command))
-    application.add_handler(CommandHandler("settime", settime_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_with_groq))
+    application.add_handler(CommandHandler("start", tg_start_command))
+    application.add_handler(CommandHandler("help", tg_help_command))
+    application.add_handler(CommandHandler("save", tg_save_command))
+    application.add_handler(CommandHandler("ontap", tg_ontap_command))
+    application.add_handler(CommandHandler("list", tg_list_command))
+    application.add_handler(CommandHandler("search", tg_search_command))
+    application.add_handler(CommandHandler("settime", tg_settime_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_chat_handler))
 
     job_queue = application.job_queue
     if job_queue:
@@ -546,7 +515,7 @@ async def run_bot():
     async with application:
         await application.start()
         await application.updater.start_polling()
-        logger.info("🚀 Bot đang hoạt động với đầy đủ tính năng mới...")
+        logger.info("🚀 Bot Telegram & Lark đang chạy...")
         while True:
             await asyncio.sleep(3600)
 
