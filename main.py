@@ -68,7 +68,7 @@ def save_data(data: dict):
         except Exception as e:
             logger.error(f"Lỗi kết nối Gemini: {e}")
             return f"Lỗi kết nối mạng: {str(e)}"
-
+            
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_name = update.effective_user.first_name
