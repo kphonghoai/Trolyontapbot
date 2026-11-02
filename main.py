@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # CẤU HÌNH TOKEN VÀ KHÓA API
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-a99ff35bc29849f99f955d00717f09a6")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
@@ -45,43 +45,43 @@ def save_data(data: dict):
 
 
 async def ask_ai(prompt: str) -> str:
-    """Gọi DeepSeek REST API (mô hình deepseek-chat)"""
-    url = "https://api.deepseek.com/chat/completions"
+    """Gọi Groq REST API với mô hình llama-3.3-70b-versatile"""
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-chat",
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {
                 "role": "system",
-                "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, rõ ràng."
+                "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, tự nhiên."
             },
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.7
+        "temperature": 0.6
     }
 
     async with ClientSession() as session:
         for retry in range(2):
             try:
-                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=25) as resp:
                     data = await resp.json()
                     if resp.status == 200:
                         choices = data.get("choices", [])
                         if choices:
                             return choices[0].get("message", {}).get("content", "").strip()
-                        return "Không nhận được nội dung trả lời từ AI."
+                        return "Không nhận được phản hồi từ AI."
                     else:
                         err_msg = data.get("error", {}).get("message", str(data))
-                        logger.error(f"Lỗi DeepSeek ({resp.status}): {err_msg}")
-                        if resp.status in [500, 502, 503, 429]:
-                            await asyncio.sleep(1.5)
+                        logger.error(f"Lỗi Groq ({resp.status}): {err_msg}")
+                        if resp.status in [500, 503, 429]:
+                            await asyncio.sleep(1)
                             continue
-                        return f"Lỗi máy chủ AI ({resp.status}): {err_msg}"
+                        return f"Lỗi Groq ({resp.status}): {err_msg}"
             except Exception as e:
-                logger.error(f"Lỗi kết nối DeepSeek: {e}")
+                logger.error(f"Lỗi kết nối Groq: {e}")
                 await asyncio.sleep(1)
 
     return "Máy chủ AI hiện đang bận, bạn vui lòng gửi lại câu hỏi sau vài giây nhé!"
@@ -108,10 +108,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"Chào {user_name}! 👋\n\n"
-        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp **DeepSeek AI** siêu tốc.\n\n"
+        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp **Groq AI (Llama 3.3 70B)** siêu tốc.\n\n"
         "📌 **Các lệnh điều khiển:**\n"
         "• `/save <nội dung>`: Lưu kiến thức mới học.\n"
-        "• `/ontap`: Ôn tập bài gần nhất với câu hỏi Active Recall từ AI.\n"
+        "• `/ontap`: Ôn tập bài gần nhất với câu hỏi gợi nhớ từ AI.\n"
         "• `/list`: Xem danh sách 5 bài gần nhất.\n"
         "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>`: Tùy chỉnh giờ nhắc nhở theo ý muốn.\n"
         f"  *(Lịch hiện tại: Sáng {user_schedule.get('morning', '10:00')} | Tối {user_schedule.get('evening', '19:30')} | Nhắc {user_schedule.get('night', '22:00')})*\n\n"
@@ -220,7 +220,7 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     latest_note = user_info["notes"][-1]
-    await update.message.reply_text("🤖 DeepSeek đang soạn câu hỏi gợi nhớ...")
+    await update.message.reply_text("🤖 Groq AI đang soạn câu hỏi gợi nhớ...")
 
     prompt = (
         f"Dưới đây là ghi chú: '{latest_note['content']}'.\n"
