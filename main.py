@@ -52,7 +52,7 @@ async def ask_gemini(prompt: str) -> str:
         response = await loop.run_in_executor(
             None,
             lambda: client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-1.5-flash",
                 contents=prompt,
             )
         )
