@@ -44,8 +44,12 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    """Gọi Gemini REST API với cơ chế tự động thử lại và dự phòng khi server quá tải (503)"""
-    models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    """Gọi Gemini REST API luân chuyển qua các phiên bản flash-lite và flash để tránh quá tải"""
+    models = [
+        "gemini-3.8-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.8-pro"
+    ]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
@@ -53,7 +57,7 @@ async def ask_gemini(prompt: str) -> str:
     async with ClientSession() as session:
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            for retry in range(2):  # Thử lại tối đa 2 lần nếu gặp lỗi 503
+            for retry in range(2):
                 try:
                     async with session.post(url, json=payload, timeout=30) as resp:
                         data = await resp.json()
@@ -63,14 +67,14 @@ async def ask_gemini(prompt: str) -> str:
                                 parts = candidates[0].get("content", {}).get("parts", [])
                                 if parts:
                                     return parts[0].get("text", "")
-                        elif resp.status == 503:
-                            logger.warning(f"Model {model} quá tải (503), đang thử lại...")
-                            await asyncio.sleep(1.5)
+                        elif resp.status in [503, 429]:
+                            # Nếu quá tải hoặc bị giới hạn tốc độ, nghỉ 1 giây rồi thử lại
+                            await asyncio.sleep(1)
                             continue
                         else:
-                            break  # Nếu gặp mã lỗi khác (như 404), chuyển sang model tiếp theo
+                            break
                 except Exception as e:
-                    logger.error(f"Lỗi kết nối tới {model}: {e}")
+                    logger.error(f"Lỗi gọi {model}: {e}")
                     break
 
     return "Máy chủ AI hiện đang chịu tải cao, bạn hãy gửi lại câu hỏi sau vài giây nhé!"
