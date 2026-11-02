@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CẤU HÌNH TOKEN VÀ KHÓA API
+# CẤU HÌNH TOKEN VÀ KHÓA GROQ API
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
 
@@ -45,32 +45,26 @@ def save_data(data: dict):
 
 
 async def ask_ai(prompt: str) -> str:
-    """Gọi Groq REST API với danh sách model chính thức hỗ trợ sẵn"""
-    models = [
-        "llama-3.1-8b-instant",
-        "llama-3.1-70b-versatile",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it"
-    ]
+    """Gọi Groq REST API với mô hình llama-3.1-8b-instant"""
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, tự nhiên."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.6
+    }
 
     async with ClientSession() as session:
-        for model in models:
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. Nhiệm vụ của bạn là hỗ trợ người dùng ghi nhớ kiến thức, tóm tắt và đặt câu hỏi gợi nhớ thực tế bằng tiếng Việt súc tích, tự nhiên."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.6
-            }
+        for retry in range(2):
             try:
                 async with session.post(url, json=payload, headers=headers, timeout=25) as resp:
                     data = await resp.json()
@@ -78,14 +72,17 @@ async def ask_ai(prompt: str) -> str:
                         choices = data.get("choices", [])
                         if choices:
                             return choices[0].get("message", {}).get("content", "").strip()
-                    elif resp.status == 404:
-                        # Nếu model không tồn tại, tự động thử model tiếp theo trong danh sách
-                        continue
+                        return "Không nhận được phản hồi từ AI."
                     else:
                         err_msg = data.get("error", {}).get("message", str(data))
-                        logger.error(f"Lỗi Groq {model} ({resp.status}): {err_msg}")
+                        logger.error(f"Lỗi Groq ({resp.status}): {err_msg}")
+                        if resp.status in [500, 503, 429]:
+                            await asyncio.sleep(1)
+                            continue
+                        return f"Lỗi Groq ({resp.status}): {err_msg}"
             except Exception as e:
-                logger.error(f"Lỗi kết nối Groq ({model}): {e}")
+                logger.error(f"Lỗi kết nối Groq: {e}")
+                await asyncio.sleep(1)
 
     return "Máy chủ AI hiện đang bận, bạn vui lòng gửi lại câu hỏi sau vài giây nhé!"
 
@@ -111,7 +108,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"Chào {user_name}! 👋\n\n"
-        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp **Groq AI (Llama 3.3 70B)** siêu tốc.\n\n"
+        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp **Groq AI (Llama 3.1 8B)** siêu tốc.\n\n"
         "📌 **Các lệnh điều khiển:**\n"
         "• `/save <nội dung>`: Lưu kiến thức mới học.\n"
         "• `/ontap`: Ôn tập bài gần nhất với câu hỏi gợi nhớ từ AI.\n"
