@@ -19,7 +19,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JKXn4QK86_jTBWE6ogqNTf_txh8jiYMvBZcjscHGB8QA")
+
+# DANH SÁCH 2 KHÓA API GEMINI TỰ ĐỘNG DỰ PHÒNG
+GEMINI_API_KEYS = [
+    os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JKXn4QK86_jTBWE6ogqNTf_txh8jiYMvBZcjscHGB8QA"),
+    "AQ.Ab8RN6KApSH2yUbh2qpaCW8-BF4kt2Le6UIUNwScWYp5LzudWg"
+]
 
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
@@ -44,7 +49,7 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    """Gọi Gemini REST API luân chuyển qua các phiên bản flash-lite và flash để tránh quá tải"""
+    """Gọi Gemini REST API luân chuyển qua 2 API Key và 3 Model để chống nghẽn hoàn toàn"""
     models = [
         "gemini-3.8-flash-lite",
         "gemini-3.8-flash",
@@ -55,29 +60,31 @@ async def ask_gemini(prompt: str) -> str:
     }
 
     async with ClientSession() as session:
-        for model in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            for retry in range(2):
-                try:
-                    async with session.post(url, json=payload, timeout=30) as resp:
-                        data = await resp.json()
-                        if resp.status == 200:
-                            candidates = data.get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                if parts:
-                                    return parts[0].get("text", "")
-                        elif resp.status in [503, 429]:
-                            # Nếu quá tải hoặc bị giới hạn tốc độ, nghỉ 1 giây rồi thử lại
-                            await asyncio.sleep(1)
-                            continue
-                        else:
-                            break
-                except Exception as e:
-                    logger.error(f"Lỗi gọi {model}: {e}")
-                    break
+        for api_key in GEMINI_API_KEYS:
+            for model in models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                for retry in range(2):
+                    try:
+                        async with session.post(url, json=payload, timeout=25) as resp:
+                            data = await resp.json()
+                            if resp.status == 200:
+                                candidates = data.get("candidates", [])
+                                if candidates:
+                                    parts = candidates[0].get("content", {}).get("parts", [])
+                                    if parts:
+                                        return parts[0].get("text", "")
+                            elif resp.status in [503, 429]:
+                                logger.warning(f"Key ...{api_key[-6:]} | Model {model} chịu tải ({resp.status}). Đang thử lại/chuyển luồng...")
+                                await asyncio.sleep(1)
+                                continue
+                            else:
+                                logger.warning(f"Model {model} báo mã {resp.status}: {data.get('error', {}).get('message')}")
+                                break
+                    except Exception as e:
+                        logger.error(f"Lỗi kết nối tới {model}: {e}")
+                        break
 
-    return "Máy chủ AI hiện đang chịu tải cao, bạn hãy gửi lại câu hỏi sau vài giây nhé!"
+    return "Máy chủ AI hiện đang chịu tải cao trên toàn bộ các kênh dự phòng, bạn vui lòng gửi lại sau vài giây nhé!"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,7 +108,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"Chào {user_name}! 👋\n\n"
-        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp Gemini AI.\n\n"
+        "Tôi là **Trợ lý Ôn tập Kiến thức Cá nhân** tích hợp Gemini AI đa luồng dự phòng.\n\n"
         "📌 **Các lệnh điều khiển:**\n"
         "• `/save <nội dung>`: Lưu kiến thức mới học.\n"
         "• `/ontap`: Ôn tập nhanh bài gần nhất với câu hỏi Active Recall từ Gemini.\n"
