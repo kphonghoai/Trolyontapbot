@@ -1,21 +1,20 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Đa năng (Telegram & Lark Suite + Groq AI)
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Hợp Nhất Hoàn Chỉnh
 Tích hợp:
+- Lời chào siêu thân thiện, vui tươi và tràn đầy năng lượng cho Phong
+- Trí tuệ nhân tạo Groq AI thế hệ mới (OpenAI GPT-OSS, Qwen, Llama 3.3) khắc phục triệt để lỗi model
 - Đọc và phân tích tài liệu: Word (.docx), Excel (.xlsx), PDF (.pdf)
-- Nhận diện và đọc hình ảnh (OCR + Vision AI qua Groq Llama 3.2 Vision)
-- Tự động tóm tắt ý chính và tạo câu hỏi gợi nhớ Active Recall từ tài liệu tải lên
-- Tự động lưu nội dung cốt lõi vào danh sách bài học ôn tập
-- Bộ câu lệnh Spaced Repetition: /save, /ontap, /list, /search, /settime
-- Lời chào tràn đầy năng lượng và tích cực
-- Hỗ trợ đồng thời cả Telegram Bot và Lark Suite Webhook
+- Nhận diện chữ và phân tích hình ảnh (Groq Vision AI)
+- Đầy đủ bộ câu lệnh: /save (Spaced Repetition), /ontap (Active Recall), /list, /search, /settime
+- Chạy đồng thời 2 nền tảng: Telegram Bot & Lark Suite Webhook
+- Tự động gửi câu hỏi gợi nhớ vào 3 khung giờ: 10:00 (sáng), 19:30 (tối) và 22:00 (đêm)
 """
 
+import json
+import logging
 import os
 import io
-import re
-import json
 import base64
-import logging
 import asyncio
 from datetime import datetime, timezone, timedelta
 from telegram import Update, BotCommand
@@ -81,17 +80,17 @@ def save_data(data: dict):
         logger.error(f"Lỗi ghi file: {e}")
 
 
-# --- KẾT NỐI GROQ AI (VĂN BẢN & VISION HÌNH ẢNH) ---
+# --- KẾT NỐI GROQ AI (VĂN BẢN & HÌNH ẢNH) ---
 
 async def ask_ai(prompt: str) -> str:
-    """Truy vấn Groq AI với các model thế hệ mới chính thức trên GroqCloud."""
+    """Truy vấn Groq AI với các model chính thức trên GroqCloud (không lỗi điều khoản)."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     url = "https://api.groq.com/openai/v1/chat/completions"
 
-    # Danh sách các model chính thức trên GroqCloud hiện tại (OpenAI GPT-OSS, Qwen, Llama)
+    # Danh sách các model chính thức đang mở của Groq (GPT-OSS, Qwen, Llama 3.3)
     candidate_models = [
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
@@ -100,7 +99,7 @@ async def ask_ai(prompt: str) -> str:
         "llama-3.1-8b-instant",
     ]
 
-    last_error = "Không có phản hồi từ máy chủ Groq."
+    last_error = ""
     async with ClientSession() as session:
         for model in candidate_models:
             payload = {
@@ -129,17 +128,17 @@ async def ask_ai(prompt: str) -> str:
                             return choices[0].get("message", {}).get("content", "").strip()
                     else:
                         err_msg = data.get("error", {}).get("message", str(data))
-                        last_error = f"[{model}] ({resp.status}): {err_msg}"
-                        logger.warning(f"Lỗi Groq {last_error}")
+                        last_error = f"Model {model} ({resp.status}): {err_msg}"
+                        logger.warning(f"Thử model tiếp theo do lỗi: {last_error}")
             except Exception as e:
-                last_error = f"Lỗi kết nối [{model}]: {str(e)}"
+                last_error = f"Lỗi mạng với {model}: {str(e)}"
                 logger.warning(last_error)
 
         return f"⚠️ Lỗi kết nối Groq: {last_error}"
 
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
-    """Sử dụng Groq Vision AI để đọc và phân tích hình ảnh/tài liệu scan."""
+    """Sử dụng Groq Vision AI để đọc chữ và phân tích hình ảnh/tài liệu scan."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -182,17 +181,14 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
                     return "Không nhận được phản hồi phân tích hình ảnh."
                 else:
                     err_msg = data.get("error", {}).get("message", str(data))
-                    logger.error(f"Lỗi Groq Vision ({resp.status}): {err_msg}")
-                    return f"Lỗi Groq Vision: {err_msg}"
+                    return f"Lỗi phân tích ảnh: {err_msg}"
         except Exception as e:
-            logger.error(f"Lỗi kết nối Groq Vision: {e}")
-            return f"Lỗi phân tích hình ảnh: {str(e)}"
+            return f"Lỗi kết nối Vision: {str(e)}"
 
 
 # --- BỘ TRÍCH XUẤT VĂN BẢN TỪ FILE TÀI LIỆU ---
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Trích xuất văn bản từ file PDF."""
     try:
         reader = pypdf.PdfReader(io.BytesIO(file_bytes))
         pages_text = []
@@ -207,7 +203,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Trích xuất văn bản từ file Word (.docx)."""
     try:
         doc = docx.Document(io.BytesIO(file_bytes))
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -223,7 +218,6 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 
 
 def extract_text_from_excel(file_bytes: bytes) -> str:
-    """Trích xuất dữ liệu từ bảng tính Excel (.xlsx)."""
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
         lines = []
@@ -245,9 +239,8 @@ def extract_text_from_excel(file_bytes: bytes) -> str:
 
 
 async def process_document_content(file_name: str, text_content: str) -> str:
-    """Gọi Groq AI phân tích tài liệu và đưa ra tóm tắt + câu hỏi Active Recall."""
     if not text_content:
-        return f"⚠️ Không thể đọc được nội dung văn bản từ file `{file_name}` (hoặc file là dạng scan hình ảnh/bị khóa bảo mật)."
+        return f"⚠️ Không thể đọc được nội dung văn bản từ file `{file_name}` (file có thể là bản scan dạng ảnh hoặc có mật khẩu bảo vệ)."
 
     truncated_text = text_content[:4500]
     prompt = (
@@ -262,7 +255,7 @@ async def process_document_content(file_name: str, text_content: str) -> str:
     return (
         f"📄 **KẾT QUẢ ĐỌC VÀ PHÂN TÍCH TÀI LIỆU:** `{file_name}`\n\n"
         f"{ai_reply}\n\n"
-        f"*(💡 Mẹo: Bạn có thể gõ `/save 3ngay Tóm tắt {file_name}` để đưa bài này vào lịch nhắc ôn tập!)*"
+        f"*(💡 Mẹo: Bạn có thể gõ `/save 3ngay Tóm tắt {file_name}` để lưu bài học này nhé!)*"
     )
 
 
@@ -280,23 +273,23 @@ HELP_MESSAGE = (
     "• `/save hangngay <nội dung>`: Nhắc bài hàng ngày\n"
     "*(Ví dụ: `/save 3ngay Quy trình kiểm kê định kỳ bưu cục`)*\n\n"
     "📎 **2. ĐỌC FILE TÀI LIỆU & HÌNH ẢNH:**\n"
-    "• Gửi trực tiếp file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** vào chat $\\rightarrow$ Bot tự đọc và tóm tắt!\n"
-    "• Gửi **Hình ảnh chụp tài liệu/sách vở** $\\rightarrow$ AI Vision tự động đọc chữ và ra câu hỏi ôn tập!\n\n"
+    "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** $\\rightarrow$ Bot tự đọc và tóm tắt!\n"
+    "• Gửi **Ảnh chụp tài liệu/sách vở** $\\rightarrow$ AI Vision tự động đọc chữ và ra bài tập ôn tập!\n\n"
     "🔍 **3. XEM LẠI & TÌM KIẾM BÀI CŨ:**\n"
     "• `/list`: Xem danh sách tất cả các bài đã lưu kèm mã #ID\n"
-    "• `/search <từ khóa>`: Tìm kiếm bài theo nội dung (Ví dụ: `/search bưu cục`)\n\n"
+    "• `/search <từ khóa>`: Tìm kiếm bài theo nội dung *(Ví dụ: `/search bưu cục`)*\n\n"
     "🎯 **4. ÔN TẬP VỚI CÂU HỎI AI:**\n"
     "• `/ontap`: Ôn tập bài gần nhất vừa lưu\n"
-    "• `/ontap <id>`: Ôn tập đích danh một bài cũ bất kỳ (Ví dụ: `/ontap 2`)\n\n"
+    "• `/ontap <id>`: Ôn tập đích danh một bài cũ bất kỳ *(Ví dụ: `/ontap 2`)*\n\n"
     "⚙️ **5. CÀI ĐẶT THỜI GIAN NHẮC:**\n"
-    "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>` (Ví dụ: `/settime 09:00 19:30 22:00`)\n\n"
+    "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>` *(Ví dụ: `/settime 09:00 19:30 22:00`)*\n\n"
     "💡 *Mẹo: Bạn có thể nhắn tin hỏi đáp tự do bất kỳ lúc nào!*"
 )
 
 
 # --- BỘ XỬ LÝ LỆNH CHUNG CHO CẢ TELEGRAM VÀ LARK SUITE ---
 
-def init_user_container(user_data_dict: dict, user_id: str, default_name: str = "Bạn"):
+def init_user_container(user_data_dict: dict, user_id: str, default_name: str = "Phong"):
     if user_id not in user_data_dict:
         user_data_dict[user_id] = {
             "name": default_name,
@@ -512,7 +505,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Bạn")
+    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
 
     res = core_settime(data["users"][chat_id], context.args)
     save_data(data)
@@ -522,7 +515,7 @@ async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Bạn")
+    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
 
     args_text = " ".join(context.args) if context.args else ""
     res = core_save_note(data["users"][chat_id], args_text)
@@ -533,7 +526,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Bạn")
+    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
 
     await update.message.reply_text("🤖 Groq AI đang soạn câu hỏi gợi nhớ...")
     arg_id = context.args[0] if context.args else ""
@@ -544,7 +537,7 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Bạn")
+    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
 
     res = core_list_notes(data["users"][chat_id])
     await update.message.reply_text(res, parse_mode="Markdown")
@@ -553,7 +546,7 @@ async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Bạn")
+    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
 
     keyword = " ".join(context.args).strip() if context.args else ""
     res = core_search_notes(data["users"][chat_id], keyword)
@@ -576,7 +569,6 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
 # --- XỬ LÝ NHẬN FILE TÀI LIỆU VÀ ẢNH TRÊN TELEGRAM ---
 
 async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý khi người dùng gửi file Word, Excel, PDF hoặc file ảnh dạng văn bản."""
     doc = update.message.document
     file_name = doc.file_name or "document"
     ext = file_name.split(".")[-1].lower() if "." in file_name else ""
@@ -617,7 +609,6 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
 
 
 async def telegram_handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý khi người dùng chụp hoặc gửi hình ảnh trực tiếp qua Telegram."""
     status_msg = await update.message.reply_text("📸 Đang quét chữ và phân tích hình ảnh bằng Groq Vision AI...")
     try:
         photo = update.message.photo[-1]
@@ -683,7 +674,6 @@ async def send_lark_message(open_id: str, text: str):
 
 
 async def download_lark_file(message_id: str, file_key: str, resource_type: str = "file") -> bytes:
-    """Tải file đính kèm từ Lark Suite."""
     async with ClientSession() as session:
         token = await get_lark_tenant_token(session)
         if not token:
@@ -710,7 +700,7 @@ async def handle_lark_webhook(request):
         challenge = body.get("challenge", "")
         return web.json_response({"challenge": challenge})
 
-    # Xử lý tin nhắn
+    # Xử lý tin nhắn từ Lark
     header = body.get("header", {})
     if header.get("event_type") == "im.message.receive_v1":
         event = body.get("event", {})
@@ -736,7 +726,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
     except Exception:
         content_json = {}
 
-    # 1. Nếu là file tài liệu (Word, Excel, PDF)
+    # File Word, Excel, PDF trên Lark
     if msg_type == "file":
         file_key = content_json.get("file_key")
         file_name = content_json.get("file_name", "document")
@@ -757,7 +747,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
         await send_lark_message(open_id, analysis)
         return
 
-    # 2. Nếu là hình ảnh
+    # Hình ảnh trên Lark
     if msg_type == "image":
         image_key = content_json.get("image_key")
         await send_lark_message(open_id, "📸 Đang phân tích chữ trong hình ảnh bằng Groq Vision AI...")
@@ -768,7 +758,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
         await send_lark_message(open_id, f"🖼️ **KẾT QUẢ ĐỌC HÌNH ẢNH:**\n\n{analysis}")
         return
 
-    # 3. Nếu là tin nhắn văn bản thông thường
+    # Tin nhắn văn bản
     raw = content_json.get("text", "").strip()
     if not raw:
         return
@@ -837,7 +827,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
             if current_time_str == schedule.get("night", "22:00"):
                 if last_sent.get("night") != today_str:
                     msg = (
-                        "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟\n\n"
+                        "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
                         "Hôm nay bạn học được điều gì mới hoặc rút ra bài học gì? Bạn có thể gửi bài học bằng lệnh:\n"
                         "`/save [chu_kỳ] <nội dung>`\n"
                         "*(Hoặc gửi trực tiếp file Word, Excel, PDF, ảnh tài liệu vào đây)*\n\n"
@@ -958,7 +948,6 @@ async def setup_bot_commands(application):
 
 
 async def run_bot():
-    # 1. Khởi tạo Telegram Bot
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -988,10 +977,10 @@ async def run_bot():
     if job_queue:
         job_queue.run_repeating(dynamic_scheduler_job, interval=60, first=10)
 
-    # 2. Khởi chạy Web Server aiohttp
+    # Chạy Web Server aiohttp
     await run_web_server()
 
-    # 3. Chạy Polling Telegram
+    # Chạy Polling Telegram
     async with application:
         await application.start()
         await application.updater.start_polling()
