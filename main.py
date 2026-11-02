@@ -84,21 +84,23 @@ def save_data(data: dict):
 # --- KẾT NỐI GROQ AI (VĂN BẢN & VISION HÌNH ẢNH) ---
 
 async def ask_ai(prompt: str) -> str:
-    """Truy vấn Groq AI với các model văn bản chuẩn (Llama 3.3 / Llama 3.1) không lỗi điều khoản."""
+    """Truy vấn Groq AI với các model thế hệ mới chính thức trên GroqCloud."""
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     url = "https://api.groq.com/openai/v1/chat/completions"
 
-    # Danh sách các model chính thức, hoàn toàn mở và ổn định nhất trên Groq
+    # Danh sách các model chính thức trên GroqCloud hiện tại (OpenAI GPT-OSS, Qwen, Llama)
     candidate_models = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "gemma2-9b-it",
-        "mixtral-8x7b-32768",
     ]
 
+    last_error = "Không có phản hồi từ máy chủ Groq."
     async with ClientSession() as session:
         for model in candidate_models:
             payload = {
@@ -120,19 +122,20 @@ async def ask_ai(prompt: str) -> str:
                 async with session.post(
                     url, json=payload, headers=headers, timeout=25
                 ) as resp:
+                    data = await resp.json()
                     if resp.status == 200:
-                        data = await resp.json()
                         choices = data.get("choices", [])
                         if choices:
                             return choices[0].get("message", {}).get("content", "").strip()
                     else:
-                        data = await resp.json()
-                        err_msg = data.get("error", {}).get("message", "")
-                        logger.warning(f"Model {model} lỗi ({resp.status}): {err_msg}. Đang chuyển sang model tiếp theo...")
+                        err_msg = data.get("error", {}).get("message", str(data))
+                        last_error = f"[{model}] ({resp.status}): {err_msg}"
+                        logger.warning(f"Lỗi Groq {last_error}")
             except Exception as e:
-                logger.warning(f"Lỗi kết nối tới model {model}: {e}")
+                last_error = f"Lỗi kết nối [{model}]: {str(e)}"
+                logger.warning(last_error)
 
-        return "⚠️ Không thể kết nối tới các model AI của Groq. Vui lòng kiểm tra lại kết nối mạng hoặc API Key."
+        return f"⚠️ Lỗi kết nối Groq: {last_error}"
 
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
