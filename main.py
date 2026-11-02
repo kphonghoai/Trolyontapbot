@@ -52,7 +52,7 @@ async def ask_gemini(prompt: str) -> str:
         response = await loop.run_in_executor(
             None,
             lambda: client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
             )
         )
@@ -68,6 +68,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     if chat_id not in data["users"]:
+ 
         data["users"][chat_id] = {
             "name": user_name,
             "registered_at": datetime.now(LOCAL_TZ).isoformat(),
