@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = "9217105329:AAFt7sRUrrMXfKMhL-nNbUVqDtQSsR5CvgQ"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IZTCF3QcO9oNVYnAhs82r9iNj1g8SglnT2NpbMAlA0cg")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6JKXn4QK86_jTBWE6ogqNTf_txh8jiYMvBZcjscHGB8QA")
 
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
@@ -44,8 +44,8 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    """Gọi trực tiếp Google Gemini qua REST API tự động dò tìm model khả dụng"""
-    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    """Gọi trực tiếp Gemini qua REST API tự động dò tìm mô hình khả dụng"""
+    models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
@@ -63,12 +63,12 @@ async def ask_gemini(prompt: str) -> str:
                             if parts:
                                 return parts[0].get("text", "")
                     else:
-                        err_msg = data.get("error", {}).get("message", "Lỗi không xác định")
-                        logger.warning(f"Model {model} lỗi ({resp.status}): {err_msg}")
+                        err_msg = data.get("error", {}).get("message", "Lỗi")
+                        logger.warning(f"Model {model} ({resp.status}): {err_msg}")
             except Exception as e:
                 logger.error(f"Lỗi kết nối tới {model}: {e}")
 
-    return "Không thể kết nối đến Gemini. Vui lòng kiểm tra lại quyền hạn của khóa API Key."
+    return "Không thể nhận phản hồi từ Gemini. Vui lòng thử lại sau giây lát."
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,7 +161,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not content:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\nVí dụ:\n`/save Quy trình tiếp nhận đơn hàng...`",
+            "⚠️ Vui lòng nhập nội dung sau lệnh `/save`.\nVí dụ:\n`/save Quy trình xuất nhập tồn kho bước 1 kiểm tra đơn...`",
             parse_mode="Markdown",
         )
         return
@@ -346,3 +346,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
