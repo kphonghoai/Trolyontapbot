@@ -25,8 +25,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6IZTCF3QcO9oNVYnAhs82
 LOCAL_TZ = timezone(timedelta(hours=7))
 DATA_FILE = "study_notes.json"
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
+client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1beta'})
 
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
@@ -47,20 +46,33 @@ def save_data(data: dict):
 
 
 async def ask_gemini(prompt: str) -> str:
-    try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=prompt,
-            )
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Lỗi gọi Gemini API: {e}")
-        return f"Lỗi kết nối Gemini: {str(e)[:120]}"
+    models_to_try = [
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-flash"
+    ]
+    
+    loop = asyncio.get_running_loop()
+    last_error = ""
 
+    for model_name in models_to_try:
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda m=model_name: client.models.generate_content(
+                    model=m,
+                    contents=prompt,
+                )
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"Khong the goi model {model_name}: {e}")
+            continue
+
+    return f"Lỗi kết nối Gemini: {last_error[:150]}"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
