@@ -1,9 +1,10 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Chuẩn Hóa Toàn Diện
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Đồng Bộ Đa Nền Tảng
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
+- Đồng bộ chung dữ liệu thời gian thực giữa Telegram và Lark Suite
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
 - Hỗ trợ xóa chọn lọc từng bài học (/xoa <id>) và xóa toàn bộ (/xoatatca xacnhan)
-- Xử lý Vision OCR đa model fallback tự động trên Groq (không trùng hàm)
+- Xử lý Vision OCR đa model fallback tự động trên Groq
 - Trích xuất dữ liệu thông minh qua Groq AI trong luồng đối thoại tự nhiên
 - Chạy đồng thời Telegram Bot & Lark Suite Webhook
 """
@@ -133,29 +134,28 @@ async def db_get_note_by_id(note_id: int) -> Optional[dict]:
 
 
 async def db_get_user_notes(platform: str, user_id: str, limit: int = 15) -> List[dict]:
-    """Lấy danh sách các bài học gần nhất của user để nạp ngữ cảnh cho AI."""
+    """Lấy danh sách các bài học gần nhất trên toàn hệ thống (đồng bộ Telegram và Lark)."""
     if not DB_POOL:
         return []
     try:
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, content, cycle, cycle_label, target_date, stage, file_id, file_name, created_at
+                SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, created_at
                 FROM user_notes
-                WHERE platform = $1 AND user_id = $2
                 ORDER BY id DESC
-                LIMIT $3;
+                LIMIT $1;
                 """,
-                platform, str(user_id), limit
+                limit
             )
             return [dict(r) for r in rows]
     except Exception as e:
-        logger.error(f"Lỗi lấy danh sách ghi chú user {user_id}: {e}")
+        logger.error(f"Lỗi lấy danh sách ghi chú: {e}")
         return []
 
 
 async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int = 5) -> List[dict]:
-    """Tìm kiếm bài học theo từ khóa trong database."""
+    """Tìm kiếm bài học theo từ khóa trong kho dữ liệu chung."""
     if not DB_POOL:
         return []
     try:
@@ -164,11 +164,11 @@ async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int 
                 """
                 SELECT id, content, cycle_label, target_date, file_id, file_name, created_at
                 FROM user_notes
-                WHERE platform = $1 AND user_id = $2 AND content ILIKE $3
+                WHERE content ILIKE $1
                 ORDER BY id DESC
-                LIMIT $4;
+                LIMIT $2;
                 """,
-                platform, str(user_id), f"%{keyword}%", limit
+                f"%{keyword}%", limit
             )
             return [dict(r) for r in rows]
     except Exception as e:
@@ -248,14 +248,14 @@ async def db_get_due_notes(today_date) -> List[dict]:
 
 
 async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bool:
-    """Xóa đúng 1 bài học theo ID của người dùng."""
+    """Xóa đúng 1 bài học theo ID từ bất kỳ nền tảng nào."""
     if not DB_POOL:
         return False
     try:
         async with DB_POOL.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM user_notes WHERE platform = $1 AND user_id = $2 AND id = $3;",
-                platform, str(user_id), note_id
+                "DELETE FROM user_notes WHERE id = $1;",
+                note_id
             )
             return result.endswith("1")
     except Exception as e:
@@ -264,18 +264,15 @@ async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bo
 
 
 async def db_delete_user_data(platform: str, user_id: str) -> bool:
-    """Xóa toàn bộ bài học và tệp của người dùng trên database."""
+    """Xóa toàn bộ kho bài học và tệp khi cần làm sạch."""
     if not DB_POOL:
         return False
     try:
         async with DB_POOL.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM user_notes WHERE platform = $1 AND user_id = $2;",
-                platform, str(user_id)
-            )
+            await conn.execute("TRUNCATE TABLE user_notes RESTART IDENTITY;")
             return True
     except Exception as e:
-        logger.error(f"Lỗi xóa dữ liệu user {user_id}: {e}")
+        logger.error(f"Lỗi làm sạch dữ liệu: {e}")
         return False
 
 
@@ -558,7 +555,8 @@ async def handle_list_notes_core(platform: str, user_id: str) -> str:
         t_date = item.get("target_date")
         t_date_str = t_date.strftime("%d/%m/%Y") if t_date else "Đã thuộc bền vững"
         file_tag = f" 📎 `[{item.get('file_name')}]`" if item.get("file_id") else ""
-        reply += f"🔹 **[#{n_id}]**{file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
+        source_badge = "📱 Telegram" if item.get("platform") == "telegram" else "💼 Lark"
+        reply += f"🔹 **[#{n_id}]** ({source_badge}){file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
     return reply
 
 
@@ -598,7 +596,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
         f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã kết nối cơ sở dữ liệu Supabase, "
-        f"hỗ trợ lưu trữ kiến thức vĩnh viễn, trích xuất thông minh và quản lý tải lại file gốc đính kèm! 📚💡"
+        f"hỗ trợ lưu trữ kiến thức vĩnh viễn, đồng bộ dữ liệu thời gian thực giữa Telegram và Lark Suite! 📚💡"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
@@ -694,7 +692,7 @@ async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text(f"🗑️ Đã xóa thành công bài học **[#{note_id}]** khỏi hệ thống!", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ Không tìm thấy bài học **[#{note_id}]** (hoặc bài này không thuộc tài khoản của bạn).", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Không tìm thấy bài học **[#{note_id}]**.", parse_mode="Markdown")
 
 
 async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,7 +713,7 @@ async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await db_delete_user_data("telegram", chat_id)
     if success:
         await update.message.reply_text(
-            "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học của bạn trên Cloud!**\n"
+            "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học trên Cloud!**\n"
             "Bộ nhớ đã được làm mới hoàn toàn. Bạn có thể dùng `/save` để bắt đầu lưu kiến thức mới từ đầu! 🚀",
             parse_mode="Markdown"
         )
@@ -762,7 +760,7 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
     recent_notes = await db_get_user_notes("telegram", chat_id, limit=10)
     context_data = ""
     if recent_notes:
-        context_data = "KHO BÀI HỌC/KIẾN THỨC ĐÃ LƯU TRÊN HỆ THỐNG CỦA NGƯỜI DÙNG:\n"
+        context_data = "KHO BÀI HỌC/KIẾN THỨC ĐÃ LƯU TRÊN HỆ THỐNG:\n"
         for n in recent_notes:
             c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
             f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
@@ -1130,7 +1128,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
             context_data = "KHO BÀI HỌC/KIẾN THỨC ĐÃ LƯU TRÊN HỆ THỐNG:\n"
             for n in recent_notes:
                 c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
-                context_data += f"- [Mã #{n['id']}] (Ngày {c_date}): {n['content']}\n"
+                f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
+                context_data += f"- [Mã #{n['id']}] (Ngày {c_date}){f_note}: {n['content']}\n"
         else:
             context_data = "Chưa có bài học nào được lưu.\n"
 
