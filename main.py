@@ -2,7 +2,8 @@
 Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Chuẩn Hóa Toàn Diện
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
-- Xử lý Vision OCR đa model fallback tự động trên Groq
+- Hỗ trợ xóa chọn lọc từng bài học (/xoa <id>) và xóa toàn bộ (/xoatatca xacnhan)
+- Xử lý Vision OCR đa model fallback tự động trên Groq (không trùng hàm)
 - Trích xuất dữ liệu thông minh qua Groq AI trong luồng đối thoại tự nhiên
 - Chạy đồng thời Telegram Bot & Lark Suite Webhook
 """
@@ -246,6 +247,38 @@ async def db_get_due_notes(today_date) -> List[dict]:
         return []
 
 
+async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bool:
+    """Xóa đúng 1 bài học theo ID của người dùng."""
+    if not DB_POOL:
+        return False
+    try:
+        async with DB_POOL.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM user_notes WHERE platform = $1 AND user_id = $2 AND id = $3;",
+                platform, str(user_id), note_id
+            )
+            return result.endswith("1")
+    except Exception as e:
+        logger.error(f"Lỗi xóa bài #{note_id}: {e}")
+        return False
+
+
+async def db_delete_user_data(platform: str, user_id: str) -> bool:
+    """Xóa toàn bộ bài học và tệp của người dùng trên database."""
+    if not DB_POOL:
+        return False
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM user_notes WHERE platform = $1 AND user_id = $2;",
+                platform, str(user_id)
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Lỗi xóa dữ liệu user {user_id}: {e}")
+        return False
+
+
 # --- KẾT NỐI GROQ AI ---
 
 async def ask_ai(prompt: str) -> str:
@@ -293,7 +326,7 @@ async def ask_ai(prompt: str) -> str:
 
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
-    """Truy vấn Groq AI cho hình ảnh/OCR với cơ chế tự động thử lần lượt các model vision."""
+    """Truy vấn Groq AI Vision/OCR với các model đang hỗ trợ."""
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -302,8 +335,7 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
         "Content-Type": "application/json",
     }
     b64_img = base64.b64encode(image_bytes).decode("utf-8")
-    
-    # Danh sách model Vision đang hoạt động trên Groq
+
     candidate_vision_models = [
         "meta-llama/llama-4-scout-17b-16e-instruct",
         "qwen/qwen3.8-27b",
@@ -411,7 +443,7 @@ async def process_document_content(file_name: str, text_content: str) -> str:
 HELP_MESSAGE = (
     "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP (SUPABASE CLOUD)**\n\n"
     "📝 **1. LƯU BÀI HỌC VÀ CHU KỲ NHẮC LẶP:**\n"
-    "• `/save <nội dung>`: Lưu bài theo chu kỳ chuẩn Spaced Repetition (1 - 3 - 7 - 14 - 30 ngày)\n"
+    "• `/save <nội dung>`: Lưu bài theo chu kỳ Spaced Repetition (1 - 3 - 7 - 14 - 30 ngày)\n"
     "• `/save trongngay <nội dung>`: Nhắc kiểm tra ngay hôm nay\n"
     "• `/save 3ngay <nội dung>`: Nhắc kiểm tra sau 3 ngày\n"
     "• `/save hangngay <nội dung>`: Nhắc đều đặn mỗi ngày\n\n"
@@ -419,10 +451,13 @@ HELP_MESSAGE = (
     "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** để bot tự tóm tắt và tự động lưu mã file\n"
     "• Gửi **Ảnh chụp tài liệu/sách** để OCR và tạo câu hỏi tự kiểm tra\n"
     "• `/getfile <id>`: Yêu cầu bot gửi trả lại file gốc đính kèm của bài học\n\n"
-    "🤖 **3. TRÍCH XUẤT KIẾN THỨC BẰNG AI:**\n"
+    "🗑️ **3. XÓA BÀI HỌC & LÀM MỚI BỘ NHỚ:**\n"
+    "• `/xoa <id>`: Xóa chọn lọc 1 bài học theo mã ID (Ví dụ: `/xoa 3`)\n"
+    "• `/xoatatca`: Xóa sạch toàn bộ bài học và tệp đã lưu để bắt đầu lại\n\n"
+    "🤖 **4. TRÍCH XUẤT KIẾN THỨC BẰNG AI:**\n"
     "• Bạn có thể hỏi tự nhiên bất cứ lúc nào! *(Ví dụ: \"Hôm trước tôi lưu những gì về kiểm kê bưu cục?\", \"Tóm tắt các tài liệu tôi đã gửi\")*\n"
     "• AI sẽ tự động tra cứu kho dữ liệu Supabase và giải đáp chính xác.\n\n"
-    "🔍 **4. TRA CỨU & ÔN TẬP:**\n"
+    "🔍 **5. TRA CỨU & ÔN TẬP:**\n"
     "• `/list`: Xem danh sách các bài học đã lưu trên Cloud\n"
     "• `/search <từ khóa>`: Tìm kiếm bài học theo từ khóa\n"
     "• `/ontap` hoặc `/ontap <id>`: Ôn tập ngay tức thì với AI"
@@ -504,7 +539,7 @@ async def handle_ontap_command_core(platform: str, user_id: str, arg_id: str) ->
     ai_question = await ask_ai(prompt)
     created_str = target_note["created_at"].strftime("%d/%m/%Y") if target_note.get("created_at") else ""
     file_info = f"\n📎 *Tệp đính kèm:* `{target_note['file_name']}` (Tải lại: `/getfile {target_note['id']}`)" if target_note.get("file_id") else ""
-    
+
     reply = (
         f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**{file_info}\n\n"
         f"{ai_question}"
@@ -635,6 +670,57 @@ async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Lỗi gửi file Telegram: {e}")
         await update.message.reply_text(f"❌ Không thể tải lại tệp: {e}")
+
+
+async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh xóa chọn lọc: /xoa <id>"""
+    chat_id = str(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Vui lòng nhập mã bài học cần xóa.\n"
+            "Ví dụ: `/xoa 3`\n"
+            "💡 Mẹo: Gõ `/list` để xem danh sách mã bài học của bạn.",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        note_id = int(context.args[0].strip())
+    except ValueError:
+        await update.message.reply_text("⚠️ Mã bài học phải là số. Ví dụ: `/xoa 3`", parse_mode="Markdown")
+        return
+
+    success = await db_delete_single_note("telegram", chat_id, note_id)
+    if success:
+        await update.message.reply_text(f"🗑️ Đã xóa thành công bài học **[#{note_id}]** khỏi hệ thống!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Không tìm thấy bài học **[#{note_id}]** (hoặc bài này không thuộc tài khoản của bạn).", parse_mode="Markdown")
+
+
+async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh xóa sạch dữ liệu có xác nhận an toàn."""
+    chat_id = str(update.effective_chat.id)
+    arg = context.args[0].lower().strip() if context.args else ""
+
+    if arg != "xacnhan":
+        msg = (
+            "⚠️ **CẢNH BÁO XÓA BỘ NHỚ!**\n\n"
+            "Lệnh này sẽ **xóa sạch toàn bộ bài học, tệp và ảnh** bạn đã lưu trên cơ sở dữ liệu Cloud.\n\n"
+            "👉 Để chắc chắn thực hiện, vui lòng gõ đúng cú pháp:\n"
+            "`/xoatatca xacnhan`"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    success = await db_delete_user_data("telegram", chat_id)
+    if success:
+        await update.message.reply_text(
+            "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học của bạn trên Cloud!**\n"
+            "Bộ nhớ đã được làm mới hoàn toàn. Bạn có thể dùng `/save` để bắt đầu lưu kiến thức mới từ đầu! 🚀",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Lỗi khi thực hiện xóa dữ liệu. Vui lòng thử lại sau.")
 
 
 async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1019,6 +1105,24 @@ async def dispatch_lark_event(open_id: str, message: dict):
             await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply, note_id)
         else:
             await send_lark_message(open_id, reply)
+    elif raw.startswith("/xoa ") or raw.startswith("/del "):
+        parts = raw.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            target_id = int(parts[1])
+            success = await db_delete_single_note("lark", open_id, target_id)
+            if success:
+                await send_lark_message(open_id, f"🗑️ Đã xóa bài học [#{target_id}] khỏi hệ thống!")
+            else:
+                await send_lark_message(open_id, f"❌ Không tìm thấy bài học [#{target_id}].")
+        else:
+            await send_lark_message(open_id, "⚠️ Cú pháp: /xoa <id> (Ví dụ: /xoa 3)")
+    elif raw.startswith("/xoatatca") or raw.startswith("/xoahet"):
+        parts = raw.split()
+        if len(parts) > 1 and parts[1].lower() == "xacnhan":
+            await db_delete_user_data("lark", open_id)
+            await send_lark_message(open_id, "🧹 Đã xóa sạch toàn bộ dữ liệu bài học trên Cloud!")
+        else:
+            await send_lark_message(open_id, "⚠️ Để xóa sạch bài học, hãy gõ chính xác: /xoatatca xacnhan")
     else:
         recent_notes = await db_get_user_notes("lark", open_id, limit=10)
         context_data = ""
@@ -1140,6 +1244,8 @@ async def setup_bot_commands(application):
         BotCommand("list", "Xem các bài học đã ghi nhận"),
         BotCommand("search", "Tìm bài học cũ theo từ khóa"),
         BotCommand("getfile", "Tải lại tệp gốc đính kèm (/getfile <id>)"),
+        BotCommand("xoa", "Xóa 1 bài học theo mã ID (/xoa <id>)"),
+        BotCommand("xoatatca", "Xóa sạch bộ nhớ bài học (/xoatatca xacnhan)"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -1173,6 +1279,10 @@ async def run_bot():
     application.add_handler(CommandHandler("list", list_notes_command))
     application.add_handler(CommandHandler("search", search_notes_command))
     application.add_handler(CommandHandler("getfile", getfile_command))
+    application.add_handler(CommandHandler("xoa", xoa_command))
+    application.add_handler(CommandHandler("del", xoa_command))
+    application.add_handler(CommandHandler("xoatatca", xoatatca_command))
+    application.add_handler(CommandHandler("xoahet", xoatatca_command))
     application.add_handler(CallbackQueryHandler(telegram_callback_handler))
 
     # Đăng ký nhận file và hình ảnh
