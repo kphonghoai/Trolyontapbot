@@ -1,7 +1,8 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Hỗ trợ Lưu & Tải lại File Gốc
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Chuẩn Hóa Toàn Diện
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
+- Xử lý Vision OCR đa model fallback tự động trên Groq
 - Trích xuất dữ liệu thông minh qua Groq AI trong luồng đối thoại tự nhiên
 - Chạy đồng thời Telegram Bot & Lark Suite Webhook
 """
@@ -247,7 +248,52 @@ async def db_get_due_notes(today_date) -> List[dict]:
 
 # --- KẾT NỐI GROQ AI ---
 
+async def ask_ai(prompt: str) -> str:
+    """Truy vấn Groq AI cho văn bản thông thường qua ClientSession toàn cục."""
+    if not GROQ_API_KEY:
+        return "⚠️ Chưa cấu hình GROQ_API_KEY."
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    candidate_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b"]
+
+    last_error = ""
+    for model in candidate_models:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. "
+                        "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, gắn với thực tế."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.6,
+        }
+        try:
+            async with GLOBAL_SESSION.post(url, json=payload, headers=headers, timeout=25) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    choices = data.get("choices", [])
+                    if choices:
+                        return choices[0].get("message", {}).get("content", "").strip()
+                else:
+                    err_msg = data.get("error", {}).get("message", str(data))
+                    last_error = f"Model {model} ({resp.status}): {err_msg}"
+        except Exception as e:
+            last_error = f"Lỗi kết nối Groq với model {model}: {e}"
+
+    return f"⚠️ Lỗi kết nối Groq AI: {last_error}"
+
+
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
+    """Truy vấn Groq AI cho hình ảnh/OCR với cơ chế tự động thử lần lượt các model vision."""
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -257,15 +303,15 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
     }
     b64_img = base64.b64encode(image_bytes).decode("utf-8")
     
-    # Danh sách model Vision khả dụng trên Groq để tự động fallback
-    vision_models = [
-        "llama-3.2-90b-vision-preview",
+    # Danh sách model Vision đang hoạt động trên Groq
+    candidate_vision_models = [
         "meta-llama/llama-4-scout-17b-16e-instruct",
-        "qwen/qwen3.8-27b"
+        "qwen/qwen3.8-27b",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
     ]
 
     last_error = ""
-    for v_model in vision_models:
+    for v_model in candidate_vision_models:
         payload = {
             "model": v_model,
             "messages": [
@@ -298,48 +344,7 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
         except Exception as e:
             last_error = f"{v_model} exception: {e}"
 
-    return f"Lỗi phân tích ảnh từ tất cả model: {last_error}"
-
-async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
-    if not GROQ_API_KEY:
-        return "⚠️ Chưa cấu hình GROQ_API_KEY."
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    b64_img = base64.b64encode(image_bytes).decode("utf-8")
-    vision_model = "llama-3.2-11b-vision-preview"
-
-    payload = {
-        "model": vision_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                ],
-            }
-        ],
-        "temperature": 0.4,
-    }
-
-    try:
-        async with GLOBAL_SESSION.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=40,
-        ) as resp:
-            data = await resp.json()
-            if resp.status == 200:
-                choices = data.get("choices", [])
-                if choices:
-                    return choices[0].get("message", {}).get("content", "").strip()
-            return f"Lỗi phân tích ảnh: {data.get('error', {}).get('message', 'Không có kết quả')}"
-    except Exception as e:
-        return f"Lỗi kết nối Vision: {e}"
+    return f"Lỗi phân tích ảnh từ các model Vision: {last_error}"
 
 
 # --- BỘ ĐỌC TÀI LIỆU VĂN PHÒNG ---
@@ -623,7 +628,6 @@ async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📤 Đang gửi lại tệp gốc `{file_name}`...")
     try:
-        # Nếu là ảnh (photo)
         if file_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=f"🖼️ Tệp ảnh gốc bài #{note_id}")
         else:
@@ -719,7 +723,6 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
             txt = extract_text_from_excel(file_bytes)
         elif ext in ["png", "jpg", "jpeg", "webp"]:
             analysis = await ask_ai_vision(file_bytes, "Đọc chữ OCR và đặt 2 câu hỏi Active Recall.")
-            # Tự động lưu ảnh vào Supabase
             note_id = await db_save_note(
                 platform="telegram",
                 user_id=chat_id,
@@ -740,7 +743,6 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
             return
 
         analysis = await process_document_content(file_name, txt)
-        # Tự động lưu tài liệu vào Supabase
         note_id = await db_save_note(
             platform="telegram",
             user_id=chat_id,
@@ -775,7 +777,6 @@ async def telegram_handle_photo(update: Update, context: ContextTypes.DEFAULT_TY
             img_bytes,
             "1. Nhận diện chữ (OCR).\n2. Tóm tắt 3 ý quan trọng nhất.\n3. Đặt 2 câu hỏi Active Recall.",
         )
-        # Tự động lưu ảnh vào Supabase
         note_id = await db_save_note(
             platform="telegram",
             user_id=chat_id,
@@ -963,7 +964,6 @@ async def dispatch_lark_event(open_id: str, message: dict):
             txt = extract_text_from_excel(file_bytes)
 
         analysis = await process_document_content(file_name, txt)
-        # Lưu vào Supabase kèm file_key
         note_id = await db_save_note(
             platform="lark",
             user_id=open_id,
