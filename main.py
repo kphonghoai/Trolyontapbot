@@ -1,9 +1,10 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Phiên bản Tối ưu & Chuẩn hóa
-- Quản lý ClientSession và Async Lock an toàn chống xung đột đa nền tảng
-- Cache Lark Tenant Token tự động
-- Thuật toán Spaced Repetition bậc thang (1 - 3 - 7 - 14 - 30 ngày)
-- Tương tác nút bấm Inline Keyboard & Lark Card
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Phiên bản Tích hợp Supabase & Trích xuất AI
+- Lưu trữ vĩnh viễn trên Supabase PostgreSQL (chống mất dữ liệu khi Render restart/sleep)
+- Trích xuất dữ liệu thông minh qua Groq AI trong luồng đối thoại tự nhiên
+- Chạy đồng thời Telegram Bot & Lark Suite Webhook
+- Thuật toán Spaced Repetition (1 - 3 - 7 - 14 - 30 ngày)
+- Phân tích tài liệu Word, Excel, PDF và hình ảnh OCR
 """
 
 import json
@@ -16,6 +17,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 
+import asyncpg
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -41,55 +43,223 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 LARK_APP_ID = os.environ.get("LARK_APP_ID", "")
 LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 LOCAL_TZ = timezone(timedelta(hours=7))
-DATA_FILE = "study_notes.json"
 
-# Chu kỳ lặp lại ngắt quãng theo số ngày (Spaced Repetition Stages)
+# Chu kỳ lặp lại ngắt quãng (Spaced Repetition Stages)
 SPACED_INTERVALS = [1, 3, 7, 14, 30]
 
 # --- QUẢN LÝ TÀI NGUYÊN TOÀN CỤC ---
 GLOBAL_SESSION: Optional[ClientSession] = None
-FILE_LOCK = asyncio.Lock()
+DB_POOL: Optional[asyncpg.Pool] = None
 
 # Cache Lark Token: {"token": str, "expires_at": float}
 LARK_TOKEN_CACHE = {"token": "", "expires_at": 0.0}
 
 
-# --- QUẢN LÝ DỮ LIỆU AN TOÀN (ASYNC LOCK) ---
+# --- KẾT NỐI VÀ QUẢN LÝ DỮ LIỆU SUPABASE POSTGRESQL ---
 
-async def load_data() -> dict:
-    default_structure = {"users": {}, "lark_users": {}}
-    async with FILE_LOCK:
-        if os.path.exists(DATA_FILE):
+async def init_db():
+    """Khởi tạo connection pool tới Supabase PostgreSQL."""
+    global DB_POOL
+    if not DATABASE_URL:
+        logger.warning("⚠️ Chưa cấu hình biến DATABASE_URL! Dữ liệu sẽ không được lưu vào Supabase.")
+        return
+
+    # Chuẩn hóa tiền tố cho asyncpg
+    db_url = DATABASE_URL
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=db_url,
+            min_size=1,
+            max_size=10,
+            timeout=30,
+            command_timeout=15
+        )
+        logger.info("✅ Đã kết nối thành công tới cơ sở dữ liệu Supabase PostgreSQL!")
+    except Exception as e:
+        logger.error(f"❌ Lỗi khởi tạo kết nối Supabase: {e}")
+
+
+async def db_save_note(platform: str, user_id: str, content: str, cycle: str, cycle_label: str, target_date) -> Optional[int]:
+    """Lưu bài học vào bảng user_notes trên Supabase."""
+    if not DB_POOL:
+        logger.error("Database pool chưa sẵn sàng.")
+        return None
+    try:
+        async with DB_POOL.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, target_date, stage)
+                VALUES ($1, $2, $3, $4, $5, $6, 0)
+                RETURNING id;
+                """,
+                platform, str(user_id), content, cycle, cycle_label, target_date
+            )
+            return row["id"] if row else None
+    except Exception as e:
+        logger.error(f"Lỗi khi insert note vào Supabase: {e}")
+        return None
+
+
+async def db_get_note_by_id(note_id: int) -> Optional[dict]:
+    """Lấy chi tiết 1 bài học theo ID."""
+    if not DB_POOL:
+        return None
+    try:
+        async with DB_POOL.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, created_at
+                FROM user_notes
+                WHERE id = $1;
+                """,
+                note_id
+            )
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Lỗi lấy note #{note_id}: {e}")
+        return None
+
+
+async def db_get_user_notes(platform: str, user_id: str, limit: int = 15) -> List[dict]:
+    """Lấy danh sách các bài học gần nhất của user để nạp ngữ cảnh cho AI."""
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, cycle, cycle_label, target_date, stage, created_at
+                FROM user_notes
+                WHERE platform = $1 AND user_id = $2
+                ORDER BY id DESC
+                LIMIT $3;
+                """,
+                platform, str(user_id), limit
+            )
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Lỗi lấy danh sách ghi chú user {user_id}: {e}")
+        return []
+
+
+async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int = 5) -> List[dict]:
+    """Tìm kiếm bài học theo từ khóa trong database."""
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, cycle_label, target_date, created_at
+                FROM user_notes
+                WHERE platform = $1 AND user_id = $2 AND content ILIKE $3
+                ORDER BY id DESC
+                LIMIT $4;
+                """,
+                platform, str(user_id), f"%{keyword}%", limit
+            )
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Lỗi tìm kiếm note: {e}")
+        return []
+
+
+async def db_update_progress(note_id: int, remembered: bool) -> str:
+    """Cập nhật bậc Spaced Repetition (1-3-7-14-30 ngày) trên Supabase."""
+    if not DB_POOL:
+        return "⚠️ Cơ sở dữ liệu chưa sẵn sàng."
+
+    note = await db_get_note_by_id(note_id)
+    if not note:
+        return f"❌ Không tìm thấy bài học #{note_id}."
+
+    today = datetime.now(LOCAL_TZ).date()
+    cycle = note.get("cycle", "hangngay")
+
+    if cycle == "hangngay":
+        return f"✅ Đã ghi nhận ôn tập bài #{note_id}. Bài này vẫn sẽ được nhắc hằng ngày."
+
+    if remembered:
+        current_stage = note.get("stage", 0)
+        next_stage = current_stage + 1
+        if next_stage < len(SPACED_INTERVALS):
+            next_days = SPACED_INTERVALS[next_stage]
+            next_date = today + timedelta(days=next_days)
             try:
-                with open(DATA_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for k, v in default_structure.items():
-                        if k not in data:
-                            data[k] = v
-                    return data
+                async with DB_POOL.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE user_notes
+                        SET stage = $1, target_date = $2
+                        WHERE id = $3;
+                        """,
+                        next_stage, next_date, note_id
+                    )
+                return f"🎉 Tuyệt vời! Bài #{note_id} đã nâng lên cấp {next_stage + 1}. Lần ôn kế tiếp sau {next_days} ngày ({next_date.strftime('%d/%m/%Y')})."
             except Exception as e:
-                logger.error(f"Lỗi đọc file JSON: {e}")
-        return default_structure
-
-
-async def save_data(data: dict):
-    async with FILE_LOCK:
+                logger.error(f"Lỗi cập nhật tiến trình #{note_id}: {e}")
+                return "❌ Lỗi lưu dữ liệu lên server."
+        else:
+            try:
+                async with DB_POOL.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE user_notes SET target_date = NULL WHERE id = $1;",
+                        note_id
+                    )
+                return f"🏆 Xuất sắc! Bạn đã hoàn thành toàn bộ lộ trình ghi nhớ bền vững cho bài #{note_id}!"
+            except Exception as e:
+                logger.error(f"Lỗi cập nhật hoàn thành #{note_id}: {e}")
+                return "❌ Lỗi lưu dữ liệu lên server."
+    else:
+        # Nếu quên: lùi về bậc 0, nhắc lại vào ngày hôm sau
+        next_date = today + timedelta(days=1)
         try:
-            # Ghi an toàn thông qua file tạm để tránh corrupt khi ngắt điện/crash
-            temp_file = f"{DATA_FILE}.tmp"
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(temp_file, DATA_FILE)
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE user_notes
+                    SET stage = 0, target_date = $1
+                    WHERE id = $2;
+                    """,
+                    next_date, note_id
+                )
+            return f"💪 Đừng nản lòng! Bài #{note_id} sẽ được đưa về lịch ôn ngày mai ({next_date.strftime('%d/%m/%Y')}) để củng cố trí nhớ."
         except Exception as e:
-            logger.error(f"Lỗi ghi file JSON: {e}")
+            logger.error(f"Lỗi reset tiến trình #{note_id}: {e}")
+            return "❌ Lỗi lưu dữ liệu lên server."
+
+
+async def db_get_due_notes(today_date) -> List[dict]:
+    """Lấy danh sách các bài học đến hạn ôn tập hôm nay trên toàn hệ thống."""
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage
+                FROM user_notes
+                WHERE cycle = 'hangngay' OR target_date <= $1
+                ORDER BY id DESC;
+                """,
+                today_date
+            )
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Lỗi lấy due notes: {e}")
+        return []
 
 
 # --- KẾT NỐI GROQ AI ---
 
 async def ask_ai(prompt: str) -> str:
-    """Truy vấn Groq AI thông qua GLOBAL_SESSION dùng chung."""
+    """Truy vấn Groq AI qua ClientSession toàn cục."""
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -246,41 +416,31 @@ async def process_document_content(file_name: str, text_content: str) -> str:
 # --- BẢNG TRỢ GIÚP ---
 
 HELP_MESSAGE = (
-    "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP**\n\n"
+    "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP (SUPABASE CLOUD)**\n\n"
     "📝 **1. LƯU BÀI HỌC VÀ CHU KỲ NHẮC LẶP:**\n"
     "• `/save <nội dung>`: Lưu bài theo chu kỳ chuẩn Spaced Repetition (1 - 3 - 7 - 14 - 30 ngày)\n"
-    "• `/save trongngay <nội dung>`: Nhắc kiểm tra ngay tối nay\n"
+    "• `/save trongngay <nội dung>`: Nhắc kiểm tra ngay hôm nay\n"
     "• `/save 3ngay <nội dung>`: Nhắc kiểm tra sau 3 ngày\n"
     "• `/save hangngay <nội dung>`: Nhắc đều đặn mỗi ngày\n\n"
-    "📎 **2. ĐỌC TÀI LIỆU & HÌNH ẢNH:**\n"
+    "🤖 **2. TRÍCH XUẤT KIẾN THỨC BẰNG AI:**\n"
+    "• Bạn có thể hỏi tự nhiên bất cứ lúc nào! *(Ví dụ: \"Hôm trước tôi lưu những gì về kiểm kê bưu cục?\", \"Tóm tắt 3 bài học gần nhất của tôi\")*\n"
+    "• AI sẽ tự động tra cứu kho dữ liệu Supabase và giải đáp chính xác.\n\n"
+    "📎 **3. ĐỌC TÀI LIỆU & HÌNH ẢNH:**\n"
     "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** để bot tự tóm tắt\n"
-    "• Gửi **Ảnh chụp tài liệu/sách/bảng biểu** để OCR và tạo câu hỏi tự kiểm tra\n\n"
-    "🔍 **3. TRA CỨU & ÔN TẬP:**\n"
-    "• `/list`: Xem danh sách các bài học đang trong lộ trình\n"
+    "• Gửi **Ảnh chụp tài liệu/sách** để OCR và tạo câu hỏi tự kiểm tra\n\n"
+    "🔍 **4. TRA CỨU & ÔN TẬP:**\n"
+    "• `/list`: Xem danh sách các bài học đã lưu trên Supabase\n"
     "• `/search <từ khóa>`: Tìm kiếm lại bài học đã lưu\n"
-    "• `/ontap` hoặc `/ontap <id>`: Ôn tập ngay tức thì với AI\n\n"
-    "⚙️ **4. CÀI ĐẶT THỜI GIAN:**\n"
-    "• `/settime <giờ_sáng> <giờ_tối> <giờ_nhắc>` (Ví dụ: `/settime 09:00 19:30 22:00`)"
+    "• `/ontap` hoặc `/ontap <id>`: Ôn tập ngay tức thì với AI"
 )
 
 
-# --- QUẢN LÝ USER VÀ THUẬT TOÁN SPACED REPETITION ---
+# --- XỬ LÝ LỆNH TRÊN SUPABASE ---
 
-def init_user_container(user_data_dict: dict, user_id: str, default_name: str = "Phong"):
-    if user_id not in user_data_dict:
-        user_data_dict[user_id] = {
-            "name": default_name,
-            "registered_at": datetime.now(LOCAL_TZ).isoformat(),
-            "notes": [],
-            "schedule": {"morning": "10:00", "evening": "19:30", "night": "22:00"},
-            "last_sent": {},
-        }
-
-
-def core_save_note(user_dict: dict, args_text: str) -> str:
+async def handle_save_command_core(platform: str, user_id: str, args_text: str) -> str:
     args = args_text.strip().split()
     if not args:
-        return "⚠️ Cú pháp: `/save [chu_kỳ] <nội dung>`\nVí dụ: `/save 3ngay Quy trình giao nhận`"
+        return "⚠️ Cú pháp: `/save [chu_kỳ] <nội dung>`\nVí dụ: `/save 3ngay Quy trình giao nhận bưu cục`"
 
     now = datetime.now(LOCAL_TZ)
     today_date = now.date()
@@ -300,7 +460,6 @@ def core_save_note(user_dict: dict, args_text: str) -> str:
         cycle_type, offset_days, cycle_label = mode_map[first_arg]
         content = " ".join(args[1:]).strip()
     else:
-        # Mặc định theo lộ trình lặp lại ngắt quãng (Spaced Repetition)
         cycle_type, offset_days, cycle_label = ("spaced", 0, "Lộ trình ghi nhớ bền vững (1-3-7-14-30 ngày)")
         content = " ".join(args).strip()
 
@@ -314,22 +473,12 @@ def core_save_note(user_dict: dict, args_text: str) -> str:
     else:
         target_date = today_date
 
-    note_id = len(user_dict["notes"]) + 1
-    new_note = {
-        "id": note_id,
-        "date": now.strftime("%Y-%m-%d %H:%M"),
-        "created_date": today_date.isoformat(),
-        "target_date": target_date.isoformat(),
-        "cycle": cycle_type,
-        "stage": 0,  # Bậc Spaced Repetition hiện tại
-        "cycle_label": cycle_label,
-        "content": content,
-        "review_count": 0,
-    }
-    user_dict["notes"].append(new_note)
+    note_id = await db_save_note(platform, user_id, content, cycle_type, cycle_label, target_date)
+    if not note_id:
+        return "❌ Lỗi lưu dữ liệu vào Supabase! Hãy kiểm tra lại biến DATABASE_URL."
 
     return (
-        f"✅ **Đã ghi nhận kiến thức [Mã #{note_id}]!**\n\n"
+        f"✅ **Đã lưu kiến thức bền vững [Mã #{note_id}]!** ☁️\n\n"
         f"📝 *Nội dung:* {content}\n"
         f"⏰ *Chế độ:* **{cycle_label}**\n"
         f"📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`\n\n"
@@ -337,62 +486,21 @@ def core_save_note(user_dict: dict, args_text: str) -> str:
     )
 
 
-def update_note_progress(user_dict: dict, note_id: int, remembered: bool) -> str:
-    """Cập nhật bậc Spaced Repetition khi người dùng phản hồi đã thuộc hay chưa."""
-    today = datetime.now(LOCAL_TZ).date()
-    target_note = None
-    for n in user_dict.get("notes", []):
-        if n.get("id") == note_id:
-            target_note = n
-            break
-
-    if not target_note:
-        return "Không tìm thấy ghi chú."
-
-    target_note["review_count"] = target_note.get("review_count", 0) + 1
-
-    if target_note.get("cycle") == "hangngay":
-        return f"✅ Đã ghi nhận ôn tập bài #{note_id}. Bài này vẫn sẽ nhắc hằng ngày."
-
-    if remembered:
-        current_stage = target_note.get("stage", 0)
-        next_stage = current_stage + 1
-        if next_stage < len(SPACED_INTERVALS):
-            target_note["stage"] = next_stage
-            next_days = SPACED_INTERVALS[next_stage]
-            next_date = today + timedelta(days=next_days)
-            target_note["target_date"] = next_date.isoformat()
-            return f"🎉 Tuyệt vời! Bài #{note_id} đã nâng lên cấp {next_stage + 1}. Lần ôn kế tiếp sau {next_days} ngày ({next_date.strftime('%d/%m/%Y')})."
-        else:
-            target_note["target_date"] = None
-            return f"🏆 Xuất sắc! Bạn đã hoàn thành toàn bộ lộ trình ghi nhớ bền vững cho bài #{note_id}!"
-    else:
-        # Nếu quên: lùi về bậc 0 (nhắc lại vào ngày mai)
-        target_note["stage"] = 0
-        next_date = today + timedelta(days=1)
-        target_note["target_date"] = next_date.isoformat()
-        return f"💪 Đừng nản lòng! Bài #{note_id} sẽ được đặt lại lịch ôn vào ngày mai ({next_date.strftime('%d/%m/%Y')}) để củng cố trí nhớ."
-
-
-async def core_ontap(user_dict: dict, arg_id: str) -> (str, Optional[int]):
-    notes = user_dict.get("notes", [])
-    if not notes:
-        return "Bạn chưa có bài học nào. Dùng lệnh `/save <nội dung>` để lưu bài mới.", None
-
+async def handle_ontap_command_core(platform: str, user_id: str, arg_id: str) -> (str, Optional[int]):
     target_note = None
     if arg_id.strip():
         try:
             t_id = int(arg_id.strip())
-            for n in notes:
-                if n.get("id") == t_id:
-                    target_note = n
-                    break
+            target_note = await db_get_note_by_id(t_id)
             if not target_note:
-                return f"❌ Không tìm thấy bài học #{t_id}.", None
+                return f"❌ Không tìm thấy bài học #{t_id} trên cơ sở dữ liệu.", None
         except ValueError:
-            return "⚠️ Mã bài học phải là chữ số.", None
+            return "⚠️ Mã bài học phải là chữ số. Ví dụ: `/ontap 1`", None
     else:
-        target_note = notes[-1]
+        user_notes = await db_get_user_notes(platform, user_id, limit=1)
+        if not user_notes:
+            return "Bạn chưa có bài học nào. Dùng lệnh `/save <nội dung>` để lưu bài mới.", None
+        target_note = user_notes[0]
 
     prompt = (
         f"Ghi chú kiến thức: '{target_note['content']}'.\n"
@@ -400,60 +508,42 @@ async def core_ontap(user_dict: dict, arg_id: str) -> (str, Optional[int]):
         "để người học tự kiểm tra xem mình đã hiểu sâu hay chưa."
     )
     ai_question = await ask_ai(prompt)
+    created_str = target_note["created_at"].strftime("%d/%m/%Y") if target_note.get("created_at") else ""
     reply = (
-        f"📚 **Ôn tập bài [#{target_note['id']}] (Lưu ngày: {target_note['date']}):**\n\n"
+        f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**\n\n"
         f"{ai_question}"
     )
     return reply, target_note["id"]
 
 
-def core_list_notes(user_dict: dict) -> str:
-    notes = user_dict.get("notes", [])
+async def handle_list_notes_core(platform: str, user_id: str) -> str:
+    notes = await db_get_user_notes(platform, user_id, limit=10)
     if not notes:
-        return "Danh sách học tập đang trống. Hãy dùng `/save` để thêm bài!"
+        return "Danh sách học tập của bạn trên Supabase đang trống. Hãy dùng `/save` để thêm bài!"
 
-    reply = f"📚 **Danh sách {len(notes)} bài học đã lưu:**\n\n"
-    for item in notes[-10:]:
+    reply = f"📚 **Danh sách {len(notes)} bài học gần nhất đã lưu trên Cloud:**\n\n"
+    for item in notes:
         n_id = item.get("id")
-        t_date = item.get("target_date") or "Đã thuộc bền vững"
-        reply += f"🔹 **[#{n_id}]** (Kế hoạch: `{t_date}`)\n👉 {item['content'][:100]}...\n\n"
+        t_date = item.get("target_date")
+        t_date_str = t_date.strftime("%d/%m/%Y") if t_date else "Đã thuộc bền vững"
+        reply += f"🔹 **[#{n_id}]** (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
     return reply
 
 
-def core_search_notes(user_dict: dict, keyword: str) -> str:
-    kw = keyword.strip().lower()
+async def handle_search_notes_core(platform: str, user_id: str, keyword: str) -> str:
+    kw = keyword.strip()
     if not kw:
         return "Vui lòng nhập từ khóa: `/search <từ khóa>`"
 
-    notes = user_dict.get("notes", [])
-    matched = [n for n in notes if kw in n["content"].lower()]
+    matched = await db_search_notes(platform, user_id, kw, limit=5)
     if not matched:
-        return f"🔍 Không tìm thấy kết quả nào với từ khóa '{keyword}'."
+        return f"🔍 Không tìm thấy kết quả nào với từ khóa '{keyword}' trên Cloud."
 
-    reply = f"🔍 **Tìm thấy {len(matched)} kết quả:**\n\n"
-    for item in matched[:5]:
-        reply += f"📌 **[#{item['id']}]** `({item['date']})`:\n{item['content']}\n\n"
+    reply = f"🔍 **Tìm thấy {len(matched)} kết quả phù hợp:**\n\n"
+    for item in matched:
+        created_str = item["created_at"].strftime("%d/%m/%Y") if item.get("created_at") else ""
+        reply += f"📌 **[#{item['id']}]** `({created_str})`:\n{item['content']}\n\n"
     return reply
-
-
-def core_settime(user_dict: dict, args_list: list) -> str:
-    if not args_list or len(args_list) != 3:
-        return "⚠️ Nhập đủ 3 khung giờ HH:MM. Ví dụ: `/settime 09:00 19:30 22:00`"
-
-    for t_str in args_list:
-        try:
-            h, m = map(int, t_str.split(":"))
-            if not (0 <= h <= 23 and 0 <= m <= 59):
-                raise ValueError
-        except Exception:
-            return f"❌ Định dạng giờ `{t_str}` không hợp lệ."
-
-    user_dict["schedule"] = {
-        "morning": args_list[0],
-        "evening": args_list[1],
-        "night": args_list[2],
-    }
-    return f"✅ Lịch nhắc mới: ☀️ Sáng **{args_list[0]}** | 🎯 Tối **{args_list[1]}** | 🌙 Đêm **{args_list[2]}**"
 
 
 # --- GIAO DIỆN NÚT BẤM (TELEGRAM INLINE KEYBOARD) ---
@@ -471,17 +561,11 @@ def make_recall_keyboard(note_id: int) -> InlineKeyboardMarkup:
 # --- TELEGRAM HANDLERS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
     user_name = update.effective_user.first_name or "Phong"
-
-    data = await load_data()
-    init_user_container(data["users"], chat_id, user_name)
-    await save_data(data)
-
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
-        f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức**. Hãy gửi ghi chú, tài liệu Word/Excel/PDF hoặc ảnh chụp vào đây, "
-        f"tôi sẽ hỗ trợ bạn thiết lập quy trình Active Recall & Spaced Repetition hiệu quả nhất! 📚💡"
+        f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã kết nối cơ sở dữ liệu Supabase, "
+        f"giúp lưu trữ kiến thức an toàn vĩnh viễn và tự động trích xuất bằng AI trong lúc trò chuyện! 📚💡"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
@@ -493,23 +577,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
-
     args_text = " ".join(context.args) if context.args else ""
-    res = core_save_note(data["users"][chat_id], args_text)
-    await save_data(data)
+    res = await handle_save_command_core("telegram", chat_id, args_text)
     await update.message.reply_text(res, parse_mode="Markdown")
 
 
 async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
-
     arg_id = context.args[0] if context.args else ""
-    res, note_id = await core_ontap(data["users"][chat_id], arg_id)
-
+    res, note_id = await handle_ontap_command_core("telegram", chat_id, arg_id)
     if note_id:
         await update.message.reply_text(res, reply_markup=make_recall_keyboard(note_id))
     else:
@@ -518,25 +594,14 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
-    await update.message.reply_text(core_list_notes(data["users"][chat_id]), parse_mode="Markdown")
+    res = await handle_list_notes_core("telegram", chat_id)
+    await update.message.reply_text(res, parse_mode="Markdown")
 
 
 async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
     kw = " ".join(context.args).strip() if context.args else ""
-    await update.message.reply_text(core_search_notes(data["users"][chat_id], kw), parse_mode="Markdown")
-
-
-async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    init_user_container(data["users"], chat_id, update.effective_user.first_name or "Phong")
-    res = core_settime(data["users"][chat_id], context.args)
-    await save_data(data)
+    res = await handle_search_notes_core("telegram", chat_id, kw)
     await update.message.reply_text(res, parse_mode="Markdown")
 
 
@@ -544,50 +609,64 @@ async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
     data_str = query.data
-
     chat_id = str(update.effective_chat.id)
-    data = await load_data()
-    user_dict = data["users"].get(chat_id)
-
-    if not user_dict:
-        return
 
     if data_str.startswith("recall_ok_"):
         n_id = int(data_str.split("_")[-1])
-        msg = update_note_progress(user_dict, n_id, remembered=True)
-        await save_data(data)
+        msg = await db_update_progress(n_id, remembered=True)
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=int(chat_id), text=msg)
 
     elif data_str.startswith("recall_retry_"):
         n_id = int(data_str.split("_")[-1])
-        msg = update_note_progress(user_dict, n_id, remembered=False)
-        await save_data(data)
+        msg = await db_update_progress(n_id, remembered=False)
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=int(chat_id), text=msg)
 
 
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý trò chuyện thông thường: Tự động trích xuất dữ liệu từ Supabase đưa vào ngữ cảnh AI."""
     user_text = update.message.text.strip()
+    chat_id = str(update.effective_chat.id)
     raw_name = update.effective_user.first_name or "Phong"
     call_name = "Phong" if "phong" in raw_name.lower() or raw_name in ["Bạn", "User"] else raw_name
 
     greetings = ["hi", "hello", "xin chào", "chào", "chao", "alo", "start", "/start"]
     if user_text.lower() in greetings:
         await update.message.reply_text(
-            f"Chào {call_name}! 🌟 Hôm nay bạn muốn tìm hiểu hay ôn tập nội dung gì cùng mình? Cùng bắt đầu nhé! 🚀",
+            f"Chào {call_name}! 🌟 Hôm nay bạn muốn tìm hiểu thêm kiến thức hay tra cứu/ôn tập bài học cũ cùng mình? Cùng bắt đầu nhé! 🚀",
             parse_mode="Markdown",
         )
         return
 
     await update.message.chat.send_action("typing")
+
+    # 1. Trích xuất tự động 10 bài học gần nhất của user từ Supabase
+    recent_notes = await db_get_user_notes("telegram", chat_id, limit=10)
+    context_data = ""
+    if recent_notes:
+        context_data = "KHO BÀI HỌC/KIẾN THỨC ĐÃ LƯU TRÊN HỆ THỐNG CỦA NGƯỜI DÙNG:\n"
+        for n in recent_notes:
+            c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
+            context_data += f"- [Mã #{n['id']}] (Ngày {c_date}): {n['content']}\n"
+    else:
+        context_data = "Người dùng hiện chưa lưu bài học nào trong cơ sở dữ liệu.\n"
+
+    # 2. Xây dựng prompt thông minh kết hợp ngữ cảnh dữ liệu
     prompt = (
         f"Bạn là người bạn trợ lý học tập thân thiết của anh {call_name}.\n"
-        f"Yêu cầu:\n- Xưng hô gần gũi, gọi tên '{call_name}'.\n"
-        f"- Không nói 'Chào bạn' khô khan.\n"
-        f"- Dùng emoji tích cực (🌟, 🚀, 💡).\n- Trả lời bằng tiếng Việt tự nhiên, súc tích.\n\n"
-        f"Nội dung: '{user_text}'"
+        f"Dưới đây là dữ liệu các bài học đã lưu của {call_name}:\n"
+        f"--- BẮT ĐẦU DỮ LIỆU ĐÃ LƯU ---\n"
+        f"{context_data}"
+        f"--- KẾT THÚC DỮ LIỆU ĐÃ LƯU ---\n\n"
+        f"YÊU CẦU ĐỐI THOẠI & TRÍCH XUẤT:\n"
+        f"1. Nếu {call_name} hỏi, tìm kiếm, tóm tắt hoặc nhắc lại những bài học/quy trình đã từng lưu: hãy trích xuất chính xác từ dữ liệu trên, nêu rõ mã bài học (#ID) và giải đáp chi tiết, mạch lạc.\n"
+        f"2. Nếu {call_name} hỏi kiến thức mới bên ngoài: hãy giải thích chuyên sâu, gợi mở tư duy thực tế.\n"
+        f"3. Xưng hô gần gũi, gọi tên '{call_name}', dùng emoji tích cực (🌟, 🚀, 💡).\n"
+        f"4. Trả lời bằng tiếng Việt tự nhiên, súc tích.\n\n"
+        f"Tin nhắn của {call_name}: '{user_text}'"
     )
+
     reply = await ask_ai(prompt)
     await update.message.reply_text(reply)
 
@@ -784,24 +863,16 @@ async def handle_lark_webhook(request):
         action_data = body.get("action", {}).get("value", {})
         act_type = action_data.get("action")
         note_id = action_data.get("note_id")
-        open_id = body.get("open_id")
 
-        if act_type and note_id and open_id:
-            data = await load_data()
-            u_dict = data["lark_users"].get(open_id)
-            if u_dict:
-                remembered = (act_type == "recall_ok")
-                msg = update_note_progress(u_dict, int(note_id), remembered=remembered)
-                await save_data(data)
-                return web.json_response({"toast": {"type": "success", "content": msg}})
+        if act_type and note_id:
+            remembered = (act_type == "recall_ok")
+            msg = await db_update_progress(int(note_id), remembered=remembered)
+            return web.json_response({"toast": {"type": "success", "content": msg}})
 
     return web.json_response({"status": "success"})
 
 
 async def dispatch_lark_event(open_id: str, message: dict):
-    data = await load_data()
-    init_user_container(data["lark_users"], open_id, "Phong")
-
     msg_type = message.get("message_type")
     msg_id = message.get("message_id")
     raw_content = message.get("content", "{}")
@@ -852,129 +923,124 @@ async def dispatch_lark_event(open_id: str, message: dict):
     elif raw.lower() in ["/help", "/menu", "/lenh"]:
         await send_lark_message(open_id, HELP_MESSAGE)
     elif raw.startswith("/save"):
-        reply = core_save_note(data["lark_users"][open_id], raw[5:].strip())
-        await save_data(data)
+        reply = await handle_save_command_core("lark", open_id, raw[5:].strip())
         await send_lark_message(open_id, reply)
     elif raw == "/list":
-        await send_lark_message(open_id, core_list_notes(data["lark_users"][open_id]))
+        reply = await handle_list_notes_core("lark", open_id)
+        await send_lark_message(open_id, reply)
     elif raw.startswith("/search"):
-        await send_lark_message(open_id, core_search_notes(data["lark_users"][open_id], raw[7:].strip()))
+        reply = await handle_search_notes_core("lark", open_id, raw[7:].strip())
+        await send_lark_message(open_id, reply)
     elif raw.startswith("/ontap"):
-        reply, note_id = await core_ontap(data["lark_users"][open_id], raw[6:].strip())
+        reply, note_id = await handle_ontap_command_core("lark", open_id, raw[6:].strip())
         if note_id:
             await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply, note_id)
         else:
             await send_lark_message(open_id, reply)
-    elif raw.startswith("/settime"):
-        parts = raw[8:].strip().split()
-        reply = core_settime(data["lark_users"][open_id], parts)
-        await save_data(data)
-        await send_lark_message(open_id, reply)
     else:
+        # Tự động trích xuất ngữ cảnh Supabase cho chat thông thường trên Lark
+        recent_notes = await db_get_user_notes("lark", open_id, limit=10)
+        context_data = ""
+        if recent_notes:
+            context_data = "KHO BÀI HỌC/KIẾN THỨC ĐÃ LƯU TRÊN HỆ THỐNG:\n"
+            for n in recent_notes:
+                c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
+                context_data += f"- [Mã #{n['id']}] (Ngày {c_date}): {n['content']}\n"
+        else:
+            context_data = "Chưa có bài học nào được lưu.\n"
+
         prompt = (
-            f"Bạn là người bạn trợ lý học tập thân thiết của anh Phong. Xưng hô tự nhiên, gọi tên Phong, "
-            f"dùng emoji vui vẻ (🌟, 🚀, 💡). Trả lời ngắn gọn: '{raw}'"
+            f"Bạn là người bạn trợ lý học tập thân thiết của anh Phong.\n"
+            f"Dưới đây là các bài học Phong đã lưu:\n{context_data}\n\n"
+            f"Hãy giải đáp tin nhắn của Phong, nếu liên quan bài học cũ hãy trích xuất chính xác kèm mã bài học (#ID). "
+            f"Xưng hô tự nhiên, gọi tên Phong, dùng emoji vui vẻ (🌟, 🚀, 💡): '{raw}'"
         )
         reply = await ask_ai(prompt)
         await send_lark_message(open_id, reply)
 
 
-# --- BỘ LẬP LỊCH TỰ ĐỘNG (DYNAMIC SCHEDULER) ---
+# --- BỘ LẬP LỊCH TỰ ĐỘNG (DYNAMIC SCHEDULER TRÊN DATABASE) ---
 
 async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
-    today_str = now.date().isoformat()
+    today_date = now.date()
 
-    data = await load_data()
-    updated = False
+    # Khung giờ nhắc mặc định
+    is_morning = (current_time_str == "10:00")
+    is_evening = (current_time_str == "19:30")
+    is_night = (current_time_str == "22:00")
 
-    platform_groups = [
-        ("telegram", data.get("users", {})),
-        ("lark", data.get("lark_users", {})),
-    ]
+    if not (is_morning or is_evening or is_night):
+        return
 
-    for platform, users_dict in platform_groups:
-        for user_id, user_data in users_dict.items():
-            schedule = user_data.get(
-                "schedule", {"morning": "10:00", "evening": "19:30", "night": "22:00"}
-            )
-            last_sent = user_data.get("last_sent", {})
-            notes = user_data.get("notes", [])
-
-            # 1. Nhắc nhở tổng kết đêm (22:00)
-            if current_time_str == schedule.get("night", "22:00") and last_sent.get("night") != today_str:
-                msg = (
-                    "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
-                    "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
-                    "`/save [chu_kỳ] <nội dung>` hoặc gửi file tài liệu để lưu lại nhé!"
-                )
-                try:
-                    if platform == "telegram":
-                        await context.bot.send_message(chat_id=int(user_id), text=msg, parse_mode="Markdown")
-                    else:
-                        await send_lark_message(user_id, msg)
-                    last_sent["night"] = today_str
-                    updated = True
-                except Exception as e:
-                    logger.error(f"Lỗi gửi nhắc đêm: {e}")
-
-            # 2. Khung giờ ôn tập Sáng (10:00) & Tối (19:30)
-            is_morning = (current_time_str == schedule.get("morning", "10:00")) and (last_sent.get("morning") != today_str)
-            is_evening = (current_time_str == schedule.get("evening", "19:30")) and (last_sent.get("evening") != today_str)
-
-            if is_morning or is_evening:
-                # Tìm các bài học đến hạn kiểm tra hôm nay
-                due_notes = [
-                    n for n in notes
-                    if n.get("cycle") == "hangngay" or (n.get("target_date") and n.get("target_date") <= today_str)
-                ]
-
-                if due_notes:
-                    selected_note = due_notes[-1]
-                    session_name = "buổi sáng" if is_morning else "buổi tối"
-                    prompt = (
-                        f"Ghi chú: '{selected_note['content']}'.\n"
-                        f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
-                    )
-                    ai_q = await ask_ai(prompt)
-                    title = "☀️ **Active Recall Sáng Nay:** 🧠🔥" if is_morning else "🎯 **Tình Huống Vận Dụng Tối Nay:** 🚀✨"
-                    body = (
-                        f"{title}\n\n"
-                        f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
-                        f"{ai_q}"
-                    )
-
-                    try:
-                        n_id = selected_note["id"]
-                        if platform == "telegram":
-                            await context.bot.send_message(
-                                chat_id=int(user_id),
-                                text=body,
-                                reply_markup=make_recall_keyboard(n_id),
-                                parse_mode="Markdown",
-                            )
+    # Nhắc tổng kết đêm lúc 22:00
+    if is_night:
+        msg = (
+            "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
+            "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
+            "`/save [chu_kỳ] <nội dung>` hoặc gửi file tài liệu để lưu vào Supabase Cloud nhé!"
+        )
+        # Gửi nhắc tới người dùng Telegram gần nhất
+        try:
+            if DB_POOL:
+                async with DB_POOL.acquire() as conn:
+                    users = await conn.fetch("SELECT DISTINCT platform, user_id FROM user_notes;")
+                    for u in users:
+                        p, uid = u["platform"], u["user_id"]
+                        if p == "telegram":
+                            await context.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown")
                         else:
-                            await send_lark_interactive_card(user_id, title, body, n_id)
+                            await send_lark_message(uid, msg)
+        except Exception as e:
+            logger.error(f"Lỗi gửi nhắc đêm: {e}")
+        return
 
-                        if is_morning:
-                            last_sent["morning"] = today_str
-                        if is_evening:
-                            last_sent["evening"] = today_str
-                        updated = True
-                    except Exception as e:
-                        logger.error(f"Lỗi gửi nhắc định kỳ: {e}")
+    # Khung giờ ôn tập Sáng (10:00) & Tối (19:30)
+    due_notes = await db_get_due_notes(today_date)
+    if not due_notes:
+        return
 
-            user_data["last_sent"] = last_sent
+    # Nhóm theo từng user để nhắc bài
+    user_map = {}
+    for n in due_notes:
+        key = (n["platform"], n["user_id"])
+        if key not in user_map:
+            user_map[key] = n
 
-    if updated:
-        await save_data(data)
+    for (platform, user_id), selected_note in user_map.items():
+        session_name = "buổi sáng" if is_morning else "buổi tối"
+        prompt = (
+            f"Ghi chú: '{selected_note['content']}'.\n"
+            f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
+        )
+        ai_q = await ask_ai(prompt)
+        title = "☀️ **Active Recall Sáng Nay:** 🧠🔥" if is_morning else "🎯 **Tình Huống Vận Dụng Tối Nay:** 🚀✨"
+        body = (
+            f"{title}\n\n"
+            f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
+            f"{ai_q}"
+        )
+
+        n_id = selected_note["id"]
+        try:
+            if platform == "telegram":
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=body,
+                    reply_markup=make_recall_keyboard(n_id),
+                    parse_mode="Markdown",
+                )
+            else:
+                await send_lark_interactive_card(user_id, title, body, n_id)
+        except Exception as e:
+            logger.error(f"Lỗi gửi tin nhắc định kỳ ({platform}): {e}")
 
 
 # --- WEB SERVER & APP LIFECYCLE ---
 
 async def handle_ping(request):
-    return web.Response(text="Trợ lý Học tập Thông minh (Telegram & Lark Suite) đang hoạt động ổn định 24/7!")
+    return web.Response(text="Trợ lý Học tập Thông minh (Supabase Cloud + Telegram + Lark) đang hoạt động 24/7!")
 
 
 async def run_web_server():
@@ -993,11 +1059,10 @@ async def run_web_server():
 async def setup_bot_commands(application):
     commands = [
         BotCommand("help", "Bảng hướng dẫn lệnh mẫu"),
-        BotCommand("save", "Lưu bài học theo chu kỳ lặp lại ngắt quãng"),
+        BotCommand("save", "Lưu bài học theo chu kỳ Spaced Repetition"),
         BotCommand("ontap", "Ôn tập kiến thức tức thì qua AI"),
         BotCommand("list", "Xem các bài học đã ghi nhận"),
         BotCommand("search", "Tìm bài học cũ theo từ khóa"),
-        BotCommand("settime", "Cài đặt 3 khung giờ nhắc"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -1008,6 +1073,9 @@ async def setup_bot_commands(application):
 async def run_bot():
     global GLOBAL_SESSION
     GLOBAL_SESSION = ClientSession()
+
+    # Khởi tạo kết nối Supabase PostgreSQL Pool
+    await init_db()
 
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ Chưa thiết lập biến môi trường TELEGRAM_BOT_TOKEN!")
@@ -1028,7 +1096,6 @@ async def run_bot():
     application.add_handler(CommandHandler("ontap", ontap_command))
     application.add_handler(CommandHandler("list", list_notes_command))
     application.add_handler(CommandHandler("search", search_notes_command))
-    application.add_handler(CommandHandler("settime", settime_command))
     application.add_handler(CallbackQueryHandler(telegram_callback_handler))
 
     # Đăng ký nhận file và hình ảnh
@@ -1048,12 +1115,14 @@ async def run_bot():
         async with application:
             await application.start()
             await application.updater.start_polling()
-            logger.info("🚀 Trợ lý Học tập Đa nền tảng đã sẵn sàng!")
+            logger.info("🚀 Trợ lý Học tập Supabase Cloud đã sẵn sàng hoạt động!")
             while True:
                 await asyncio.sleep(3600)
     finally:
         if GLOBAL_SESSION and not GLOBAL_SESSION.closed:
             await GLOBAL_SESSION.close()
+        if DB_POOL:
+            await DB_POOL.close()
 
 
 def main():
