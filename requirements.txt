@@ -3,3 +3,4 @@ aiohttp>=3.9.0
 pypdf>=3.0.0
 python-docx>=1.0.0
 openpyxl>=3.1.0
+asyncpg>=0.29.0
