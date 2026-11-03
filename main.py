@@ -247,8 +247,7 @@ async def db_get_due_notes(today_date) -> List[dict]:
 
 # --- KẾT NỐI GROQ AI ---
 
-async def ask_ai(prompt: str) -> str:
-    """Truy vấn Groq AI qua ClientSession toàn cục."""
+async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -256,27 +255,38 @@ async def ask_ai(prompt: str) -> str:
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    candidate_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b"]
+    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+    
+    # Danh sách model Vision khả dụng trên Groq để tự động fallback
+    vision_models = [
+        "llama-3.2-90b-vision-preview",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen/qwen3.8-27b"
+    ]
 
     last_error = ""
-    for model in candidate_models:
+    for v_model in vision_models:
         payload = {
-            "model": model,
+            "model": v_model,
             "messages": [
                 {
-                    "role": "system",
-                    "content": (
-                        "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. "
-                        "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, gắn với thực tế."
-                    ),
-                },
-                {"role": "user", "content": prompt},
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                    ],
+                }
             ],
-            "temperature": 0.6,
+            "temperature": 0.4,
         }
+
         try:
-            async with GLOBAL_SESSION.post(url, json=payload, headers=headers, timeout=25) as resp:
+            async with GLOBAL_SESSION.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=40,
+            ) as resp:
                 data = await resp.json()
                 if resp.status == 200:
                     choices = data.get("choices", [])
@@ -284,12 +294,11 @@ async def ask_ai(prompt: str) -> str:
                         return choices[0].get("message", {}).get("content", "").strip()
                 else:
                     err_msg = data.get("error", {}).get("message", str(data))
-                    last_error = f"Model {model} ({resp.status}): {err_msg}"
+                    last_error = f"{v_model}: {err_msg}"
         except Exception as e:
-            last_error = f"Lỗi kết nối Groq với model {model}: {e}"
+            last_error = f"{v_model} exception: {e}"
 
-    return f"⚠️ Lỗi kết nối Groq AI: {last_error}"
-
+    return f"Lỗi phân tích ảnh từ tất cả model: {last_error}"
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
     if not GROQ_API_KEY:
