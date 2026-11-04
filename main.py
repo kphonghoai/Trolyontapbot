@@ -1,13 +1,14 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Push Notification Ưu Tiên Cao (Phương Án A)
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Đồng Bộ Thông Báo & Push Notification Hai Chiều
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
 - Vòng lặp hẹn giờ độc lập chạy ngầm qua asyncio.create_task (khắc phục 100% lỗi không nhận nhắc)
+- ĐỒNG BỘ THÔNG BÁO HAI CHIỀU: Lưu bài ở Telegram sẽ tự động nhắc đồng thời trên cả Telegram và Lark Suite
 - Tích hợp Push Notification ưu tiên cao: Buộc rung & phát chuông, tự động Ghim tin nhắn (Pin) trên Telegram
 - Lark Suite kích hoạt Thẻ cảnh báo màu đỏ (Red Template) kèm rung chuông nổi bật
+- Tự động ghi nhận open_id của Lark khi tương tác để sẵn sàng nhận thông báo đẩy
 - Hỗ trợ nhắc nhở theo khung giờ / ngày giờ tùy chọn (/nhac <id> <giờ> hoặc /save HH:MM ...)
 - Hỗ trợ gắn nhãn phân loại (#quytrinh, #vandon, #cod...) và lọc theo thẻ (/list #nhan)
 - Hỗ trợ Active Recall đối thoại: AI chấm điểm câu trả lời văn bản & voice trực tiếp
-- Đồng bộ chung dữ liệu thời gian thực giữa Telegram và Lark Suite
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
 - Hỗ trợ xóa chọn lọc từng bài học (/xoa <id>) và xóa toàn bộ (/xoatatca xacnhan)
 - Chạy đồng thời Telegram Bot & Lark Suite Webhook
@@ -138,6 +139,48 @@ async def init_db():
         logger.error(f"❌ Lỗi khởi tạo kết nối Supabase: {e}")
 
 
+async def db_register_user(platform: str, user_id: str):
+    """Ghi nhận người dùng tương tác để lưu địa chỉ gửi thông báo định kỳ/hẹn giờ."""
+    if not DB_POOL or not user_id:
+        return
+    try:
+        async with DB_POOL.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM user_notes WHERE platform = $1 AND user_id = $2 LIMIT 1;",
+                platform, str(user_id)
+            )
+            if not exists:
+                # Tạo 1 bản ghi cấu hình hệ thống ẩn để lưu ID
+                await conn.execute(
+                    """
+                    INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, stage)
+                    VALUES ($1, $2, 'Cấu hình kết nối hệ thống', 'hethong', 'Hệ thống', 0);
+                    """,
+                    platform, str(user_id)
+                )
+    except Exception as e:
+        logger.debug(f"Ghi nhận user {user_id}: {e}")
+
+
+async def db_get_all_subscribers() -> List[Tuple[str, str]]:
+    """Lấy danh sách các tài khoản đang hoạt động trên cả Telegram và Lark để bắn thông báo đồng thời."""
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT platform, user_id 
+                FROM user_notes 
+                WHERE user_id IS NOT NULL AND user_id != '';
+                """
+            )
+            return [(r["platform"], r["user_id"]) for r in rows]
+    except Exception as e:
+        logger.error(f"Lỗi lấy subscribers: {e}")
+        return []
+
+
 async def db_save_note(
     platform: str,
     user_id: str,
@@ -212,7 +255,7 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
                     """
                     SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
-                    WHERE $1 = ANY(tags) OR content ILIKE $2
+                    WHERE cycle != 'hethong' AND ($1 = ANY(tags) OR content ILIKE $2)
                     ORDER BY id DESC
                     LIMIT $3;
                     """,
@@ -223,6 +266,7 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
                     """
                     SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
+                    WHERE cycle != 'hethong'
                     ORDER BY id DESC
                     LIMIT $1;
                     """,
@@ -243,7 +287,7 @@ async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int 
                 """
                 SELECT id, content, cycle_label, target_date, file_id, file_name, tags, remind_at, created_at
                 FROM user_notes
-                WHERE content ILIKE $1
+                WHERE cycle != 'hethong' AND content ILIKE $1
                 ORDER BY id DESC
                 LIMIT $2;
                 """,
@@ -313,7 +357,7 @@ async def db_get_due_notes(today_date) -> List[dict]:
                 """
                 SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at
                 FROM user_notes
-                WHERE cycle = 'hangngay' OR target_date <= $1
+                WHERE cycle != 'hethong' AND (cycle = 'hangngay' OR target_date <= $1)
                 ORDER BY id DESC;
                 """,
                 today_date
@@ -334,7 +378,7 @@ async def db_get_custom_remind_notes(now_dt: datetime) -> List[dict]:
                 """
                 SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at
                 FROM user_notes
-                WHERE remind_at IS NOT NULL AND remind_at <= $1
+                WHERE cycle != 'hethong' AND remind_at IS NOT NULL AND remind_at <= $1
                 ORDER BY remind_at ASC;
                 """,
                 now_dt
@@ -576,7 +620,7 @@ HELP_MESSAGE = (
     "• `/save 14:30 #vandon Kiểm tra gói hàng`: Đặt nhắc chính xác lúc 14:30 hôm nay\n"
     "• `/save 05/11 09:00 #quytrinh Họp bưu cục`: Đặt nhắc ngày và giờ cụ thể\n"
     "• `/nhac <id> <thời gian>`: Đặt giờ nhắc cho bài đã có (Ví dụ: `/nhac 8 16:00` hoặc `/nhac 8 05/11 08:30`)\n"
-    "*(⚡ Khi đến giờ, bot sẽ tự động rung chuông và Ghim tin nhắn để đánh thức màn hình khóa)*\n\n"
+    "*(⚡ Khi đến giờ, bot sẽ tự động rung chuông, Ghim tin nhắn trên Telegram và bắn Thẻ đỏ khẩn cấp trên Lark)*\n\n"
     "📝 **2. LƯU BÀI HỌC VÀ GẮN NHÃN (TAGS):**\n"
     "• `/save #quytrinh #vandon <nội dung>`: Lưu bài theo lộ trình Spaced Repetition\n"
     "• `/save 3ngay #cod <nội dung>`: Lưu bài ôn sau 3 ngày\n"
@@ -619,7 +663,7 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
     target_date = today_date + timedelta(days=SPACED_INTERVALS[0])
     raw_content = ""
 
-    # 1. Thử nhận diện hẹn ngày giờ: DD/MM HH:MM (2 tham số đầu)
+    # 1. Thử nhận diện hẹn ngày giờ: DD/MM HH:MM
     if len(args) >= 3 and re.match(r"^\d{1,2}[/-]\d{1,2}$", args[0]) and re.match(r"^\d{1,2}:\d{2}$", args[1]):
         parsed_dt = parse_custom_datetime(f"{args[0]} {args[1]}")
         if parsed_dt:
@@ -629,7 +673,7 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
             target_date = remind_at.date()
             raw_content = " ".join(args[2:]).strip()
 
-    # 2. Thử nhận diện hẹn giờ trong ngày: HH:MM (tham số đầu)
+    # 2. Thử nhận diện hẹn giờ trong ngày: HH:MM
     if not remind_at and re.match(r"^\d{1,2}:\d{2}$", args[0]):
         parsed_dt = parse_custom_datetime(args[0])
         if parsed_dt:
@@ -639,7 +683,7 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
             target_date = remind_at.date()
             raw_content = " ".join(args[1:]).strip()
 
-    # 3. Nếu không phải hẹn giờ, kiểm tra chu kỳ truyền thống
+    # 3. Chu kỳ truyền thống
     if not remind_at:
         first_arg = args[0].lower().replace("-", "").replace("_", "")
         mode_map = {
@@ -718,7 +762,7 @@ async def handle_nhac_command_core(platform: str, user_id: str, args_text: str) 
             f"⏰ **Đã lên lịch hẹn nhắc bài [#{note_id}] thành công!**\n\n"
             f"📖 *Nội dung:* {note['content'][:120]}...\n"
             f"🔔 *Thời điểm nhắc:* `{parsed_dt.strftime('%H:%M ngày %d/%m/%Y')}`\n"
-            f"🚨 *Chế độ:* **Push Notification Ưu Tiên Cao (Tự động Ghim tin nhắn & Rung chuông)** 🎯"
+            f"🚨 *Chế độ:* **Push Notification Đồng Bộ Hai Chiều (Ghim tin nhắn & Rung chuông Telegram + Lark)** 🎯"
         )
     return "❌ Lỗi khi cập nhật lịch hẹn lên cơ sở dữ liệu."
 
@@ -812,6 +856,8 @@ def make_recall_keyboard(note_id: int) -> InlineKeyboardMarkup:
 # --- TELEGRAM HANDLERS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     user_name = update.effective_user.first_name or "Phong"
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
@@ -831,6 +877,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     args_text = " ".join(context.args) if context.args else ""
     res = await handle_save_command_core("telegram", chat_id, args_text)
     await update.message.reply_text(res, parse_mode="Markdown")
@@ -838,6 +885,7 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def nhac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     args_text = " ".join(context.args) if context.args else ""
     res = await handle_nhac_command_core("telegram", chat_id, args_text)
     await update.message.reply_text(res, parse_mode="Markdown")
@@ -845,6 +893,7 @@ async def nhac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     arg_id = context.args[0] if context.args else ""
     res, note_id = await handle_ontap_command_core("telegram", chat_id, arg_id)
     if note_id:
@@ -855,6 +904,7 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     tag_filter = context.args[0] if context.args else None
     res = await handle_list_notes_core("telegram", chat_id, tag_filter)
     await update.message.reply_text(res, parse_mode="Markdown")
@@ -862,6 +912,7 @@ async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     kw = " ".join(context.args).strip() if context.args else ""
     res = await handle_search_notes_core("telegram", chat_id, kw)
     await update.message.reply_text(res, parse_mode="Markdown")
@@ -979,6 +1030,7 @@ async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     voice = update.message.voice
     if not voice:
         return
@@ -1031,6 +1083,7 @@ async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     raw_name = update.effective_user.first_name or "Phong"
     call_name = "Phong" if "phong" in raw_name.lower() or raw_name in ["Bạn", "User"] else raw_name
 
@@ -1100,6 +1153,7 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
     doc = update.message.document
     file_name = doc.file_name or "document"
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     ext = file_name.split(".")[-1].lower() if "." in file_name else ""
 
     status_msg = await update.message.reply_text(f"📥 Đang tải và phân tích tài liệu `{file_name}`...")
@@ -1163,6 +1217,7 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
 async def telegram_handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("📸 Đang nhận diện tài liệu qua Groq Vision AI...")
     chat_id = str(update.effective_chat.id)
+    await db_register_user("telegram", chat_id)
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
@@ -1320,6 +1375,7 @@ async def handle_lark_webhook(request):
         open_id = event.get("sender", {}).get("sender_id", {}).get("open_id")
         message = event.get("message", {})
         if open_id:
+            await db_register_user("lark", open_id)
             asyncio.create_task(dispatch_lark_event(open_id, message))
 
     if body.get("action"):
@@ -1486,58 +1542,57 @@ async def dispatch_lark_event(open_id: str, message: dict):
         await send_lark_message(open_id, reply)
 
 
-# --- BỘ LẬP LỊCH TỰ ĐỘNG & PUSH NOTIFICATION ƯU TIÊN CAO (QUÉT MỖI PHÚT) ---
+# --- BỘ LẬP LỊCH TỰ ĐỘNG & PUSH NOTIFICATION ĐỒNG BỘ HAI CHIỀU ---
 
 async def dynamic_scheduler_job(bot_instance):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
     today_date = now.date()
 
-    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at) -> PUSH NOTIFICATION KHẨN CẤP
+    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at) -> BẮN THÔNG BÁO ĐỒNG THỜI CẢ 2 NỀN TẢNG
     custom_due = await db_get_custom_remind_notes(now)
-    for note in custom_due:
-        n_id = note["id"]
-        platform = note["platform"]
-        user_id = note["user_id"]
-        
-        prompt = (
-            f"Bài học: '{note['content']}'.\n"
-            "Hãy tạo 1 câu hỏi ôn tập Active Recall ngắn gọn bằng tiếng Việt để kiểm tra phản xạ ngay lúc này."
-        )
-        ai_q = await ask_ai(prompt)
-        title = "🚨 **CẢNH BÁO NHẮC NHỞ HẸN GIỜ!** 🔔⚡"
-        body = (
-            f"{title}\n\n"
-            f"📖 *Nội dung bài #{n_id}:* {note['content']}\n\n"
-            f"{ai_q}"
-        )
+    if custom_due:
+        subscribers = await db_get_all_subscribers()
+        for note in custom_due:
+            n_id = note["id"]
+            prompt = (
+                f"Bài học: '{note['content']}'.\n"
+                "Hãy tạo 1 câu hỏi ôn tập Active Recall ngắn gọn bằng tiếng Việt để kiểm tra phản xạ ngay lúc này."
+            )
+            ai_q = await ask_ai(prompt)
+            title = "🚨 **CẢNH BÁO NHẮC NHỞ HẸN GIỜ!** 🔔⚡"
+            body = (
+                f"{title}\n\n"
+                f"📖 *Nội dung bài #{n_id}:* {note['content']}\n\n"
+                f"{ai_q}"
+            )
 
-        try:
-            if platform == "telegram":
-                # Push Notification mức cao: Bật chuông/rung và tự động Ghim tin nhắn
-                sent_msg = await bot_instance.send_message(
-                    chat_id=int(user_id),
-                    text=body,
-                    reply_markup=make_recall_keyboard(n_id),
-                    parse_mode="Markdown",
-                    disable_notification=False  # Buộc phát chuông và rung
-                )
+            # Gửi đồng thời tới mọi tài khoản kết nối (Telegram & Lark)
+            for platform, uid in subscribers:
                 try:
-                    await bot_instance.pin_chat_message(
-                        chat_id=int(user_id),
-                        message_id=sent_msg.message_id,
-                        disable_notification=False
-                    )
-                except Exception as pin_err:
-                    logger.warning(f"Không thể ghim tin nhắn #{n_id}: {pin_err}")
-            else:
-                # Lark Suite: Đẩy thẻ cảnh báo màu đỏ (Red Template)
-                await send_lark_interactive_card(user_id, title, body, n_id, header_color="red")
-            
-            # Sau khi nhắc xong, hủy mốc hẹn giờ để không nhắc lặp lại
+                    if platform == "telegram":
+                        sent_msg = await bot_instance.send_message(
+                            chat_id=int(uid),
+                            text=body,
+                            reply_markup=make_recall_keyboard(n_id),
+                            parse_mode="Markdown",
+                            disable_notification=False
+                        )
+                        try:
+                            await bot_instance.pin_chat_message(
+                                chat_id=int(uid),
+                                message_id=sent_msg.message_id,
+                                disable_notification=False
+                            )
+                        except Exception as pin_err:
+                            logger.warning(f"Không thể ghim tin nhắn #{n_id} trên Telegram: {pin_err}")
+                    elif platform == "lark":
+                        await send_lark_interactive_card(uid, title, body, n_id, header_color="red")
+                except Exception as send_err:
+                    logger.error(f"Lỗi gửi nhắc hẹn giờ (#{n_id}) tới {platform}:{uid}: {send_err}")
+
+            # Sau khi nhắc xong, hủy mốc hẹn giờ để tránh nhắc lặp lại
             await db_update_remind_time(n_id, None)
-        except Exception as e:
-            logger.error(f"Lỗi gửi thông báo hẹn giờ bài #{n_id}: {e}")
 
     # 2. Khung giờ nhắc tổng kết đêm 22:00
     if current_time_str == "22:00":
@@ -1546,18 +1601,15 @@ async def dynamic_scheduler_job(bot_instance):
             "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
             "`/save [chu_kỳ] [#nhãn] <nội dung>` hoặc gửi file tài liệu để lưu vào Supabase Cloud nhé!"
         )
-        try:
-            if DB_POOL:
-                async with DB_POOL.acquire() as conn:
-                    users = await conn.fetch("SELECT DISTINCT platform, user_id FROM user_notes;")
-                    for u in users:
-                        p, uid = u["platform"], u["user_id"]
-                        if p == "telegram":
-                            await bot_instance.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown", disable_notification=False)
-                        else:
-                            await send_lark_message(uid, msg)
-        except Exception as e:
-            logger.error(f"Lỗi gửi nhắc đêm: {e}")
+        subscribers = await db_get_all_subscribers()
+        for p, uid in subscribers:
+            try:
+                if p == "telegram":
+                    await bot_instance.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown", disable_notification=False)
+                elif p == "lark":
+                    await send_lark_message(uid, msg)
+            except Exception as e:
+                logger.error(f"Lỗi gửi nhắc đêm tới {p}:{uid}: {e}")
         return
 
     # 3. Khung giờ nhắc Spaced Repetition cố định: 10:00 sáng & 19:30 tối
@@ -1570,48 +1622,44 @@ async def dynamic_scheduler_job(bot_instance):
     if not due_notes:
         return
 
-    user_map = {}
-    for n in due_notes:
-        key = (n["platform"], n["user_id"])
-        if key not in user_map:
-            user_map[key] = n
+    selected_note = due_notes[0]
+    session_name = "buổi sáng" if is_morning else "buổi tối"
+    prompt = (
+        f"Ghi chú: '{selected_note['content']}'.\n"
+        f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
+    )
+    ai_q = await ask_ai(prompt)
+    title = "☀️ **Active Recall Sáng Nay:** 🧠🔥" if is_morning else "🎯 **Tình Huống Vận Dụng Tối Nay:** 🚀✨"
+    body = (
+        f"{title}\n\n"
+        f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
+        f"{ai_q}"
+    )
 
-    for (platform, user_id), selected_note in user_map.items():
-        session_name = "buổi sáng" if is_morning else "buổi tối"
-        prompt = (
-            f"Ghi chú: '{selected_note['content']}'.\n"
-            f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
-        )
-        ai_q = await ask_ai(prompt)
-        title = "☀️ **Active Recall Sáng Nay:** 🧠🔥" if is_morning else "🎯 **Tình Huống Vận Dụng Tối Nay:** 🚀✨"
-        body = (
-            f"{title}\n\n"
-            f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
-            f"{ai_q}"
-        )
-
-        n_id = selected_note["id"]
+    n_id = selected_note["id"]
+    subscribers = await db_get_all_subscribers()
+    for platform, uid in subscribers:
         try:
             if platform == "telegram":
                 sent_msg = await bot_instance.send_message(
-                    chat_id=int(user_id),
+                    chat_id=int(uid),
                     text=body,
                     reply_markup=make_recall_keyboard(n_id),
                     parse_mode="Markdown",
                     disable_notification=False
                 )
                 try:
-                    await bot_instance.pin_chat_message(chat_id=int(user_id), message_id=sent_msg.message_id, disable_notification=False)
+                    await bot_instance.pin_chat_message(chat_id=int(uid), message_id=sent_msg.message_id, disable_notification=False)
                 except Exception:
                     pass
-            else:
-                await send_lark_interactive_card(user_id, title, body, n_id, header_color="orange")
+            elif platform == "lark":
+                await send_lark_interactive_card(uid, title, body, n_id, header_color="orange")
         except Exception as e:
-            logger.error(f"Lỗi gửi tin nhắc định kỳ ({platform}): {e}")
+            logger.error(f"Lỗi gửi nhắc định kỳ ({platform}:{uid}): {e}")
 
 
 async def scheduler_loop(application):
-    """Vòng lặp quét lịch hẹn độc lập qua asyncio, kích hoạt mỗi 60 giây."""
+    """Vòng lặp quét lịch hẹn độc lập qua asyncio, kích hoạt đều đặn mỗi 60 giây."""
     await asyncio.sleep(10)  # Đợi bot và kết nối database hoàn tất khởi động
     logger.info("⏰ Vòng lặp hẹn giờ nhắc việc độc lập đã kích hoạt thành công!")
     while True:
@@ -1698,7 +1746,7 @@ async def run_bot():
     application.add_handler(MessageHandler(filters.Document.ALL, telegram_handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_with_groq))
 
-    # Khởi chạy vòng lặp hẹn giờ độc lập chạy ngầm (thay thế JobQueue của Telegram)
+    # Khởi chạy vòng lặp hẹn giờ độc lập chạy ngầm
     asyncio.create_task(scheduler_loop(application))
 
     # Khởi chạy Web Server cho Lark
