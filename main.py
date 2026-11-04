@@ -1,11 +1,11 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Đồng Bộ Đa Nền Tảng
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Nâng Cấp Tagging & AI Chấm Điểm Recall
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
+- Hỗ trợ gắn nhãn phân loại (#quytrinh, #vandon, #cod...) và lọc theo thẻ (/list #tag)
+- Hỗ trợ Active Recall đối thoại: AI chấm điểm câu trả lời văn bản & voice trực tiếp
 - Đồng bộ chung dữ liệu thời gian thực giữa Telegram và Lark Suite
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
 - Hỗ trợ xóa chọn lọc từng bài học (/xoa <id>) và xóa toàn bộ (/xoatatca xacnhan)
-- Xử lý Vision OCR đa model fallback tự động trên Groq
-- Trích xuất dữ liệu thông minh qua Groq AI trong luồng đối thoại tự nhiên
 - Chạy đồng thời Telegram Bot & Lark Suite Webhook
 """
 
@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import io
+import re
 import base64
 import asyncio
 import time
@@ -55,6 +56,9 @@ GLOBAL_SESSION: Optional[ClientSession] = None
 DB_POOL: Optional[asyncpg.Pool] = None
 LARK_TOKEN_CACHE = {"token": "", "expires_at": 0.0}
 
+# Lưu trạng thái người dùng đang chờ trả lời câu hỏi Active Recall {user_id: note_id}
+ACTIVE_RECALL_SESSIONS: Dict[str, int] = {}
+
 
 # --- KẾT NỐI VÀ QUẢN LÝ DỮ LIỆU SUPABASE POSTGRESQL ---
 
@@ -76,11 +80,17 @@ async def init_db():
             max_size=5,
             timeout=10,
             command_timeout=5,
-            statement_cache_size=0  # Bắt buộc khi dùng Supabase Session Pooler
+            statement_cache_size=0
         )
         logger.info("✅ Đã kết nối thành công tới Supabase PostgreSQL!")
     except Exception as e:
         logger.error(f"❌ Lỗi khởi tạo kết nối Supabase: {e}")
+
+
+def extract_hashtags(text: str) -> List[str]:
+    """Tự động trích xuất các hashtag như #quytrinh, #vandon từ văn bản."""
+    tags = re.findall(r"#\w+", text)
+    return [t.lower() for t in set(tags)]
 
 
 async def db_save_note(
@@ -91,9 +101,10 @@ async def db_save_note(
     cycle_label: str = "Hằng ngày",
     target_date = None,
     file_id: Optional[str] = None,
-    file_name: Optional[str] = None
+    file_name: Optional[str] = None,
+    tags: Optional[List[str]] = None
 ) -> Optional[int]:
-    """Lưu bài học kèm mã định danh file gốc vào Supabase."""
+    """Lưu bài học kèm thẻ nhãn và mã tệp gốc vào Supabase."""
     if not DB_POOL:
         logger.error("Database pool chưa sẵn sàng.")
         return None
@@ -101,11 +112,11 @@ async def db_save_note(
         async with DB_POOL.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name)
-                VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+                INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags)
+                VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $9)
                 RETURNING id;
                 """,
-                platform, str(user_id), content, cycle, cycle_label, target_date, file_id, file_name
+                platform, str(user_id), content, cycle, cycle_label, target_date, file_id, file_name, tags or []
             )
             return row["id"] if row else None
     except Exception as e:
@@ -121,7 +132,7 @@ async def db_get_note_by_id(note_id: int) -> Optional[dict]:
         async with DB_POOL.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, created_at
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
                 FROM user_notes
                 WHERE id = $1;
                 """,
@@ -133,21 +144,34 @@ async def db_get_note_by_id(note_id: int) -> Optional[dict]:
         return None
 
 
-async def db_get_user_notes(platform: str, user_id: str, limit: int = 15) -> List[dict]:
-    """Lấy danh sách các bài học gần nhất trên toàn hệ thống (đồng bộ Telegram và Lark)."""
+async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_filter: Optional[str] = None) -> List[dict]:
+    """Lấy danh sách các bài học gần nhất (hỗ trợ lọc theo hashtag như #quytrinh)."""
     if not DB_POOL:
         return []
     try:
         async with DB_POOL.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, created_at
-                FROM user_notes
-                ORDER BY id DESC
-                LIMIT $1;
-                """,
-                limit
-            )
+            if tag_filter:
+                clean_tag = tag_filter.lower()
+                rows = await conn.fetch(
+                    """
+                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
+                    FROM user_notes
+                    WHERE $1 = ANY(tags) OR content ILIKE $2
+                    ORDER BY id DESC
+                    LIMIT $3;
+                    """,
+                    clean_tag, f"%{clean_tag}%", limit
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
+                    FROM user_notes
+                    ORDER BY id DESC
+                    LIMIT $1;
+                    """,
+                    limit
+                )
             return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Lỗi lấy danh sách ghi chú: {e}")
@@ -162,7 +186,7 @@ async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int 
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, content, cycle_label, target_date, file_id, file_name, created_at
+                SELECT id, content, cycle_label, target_date, file_id, file_name, tags, created_at
                 FROM user_notes
                 WHERE content ILIKE $1
                 ORDER BY id DESC
@@ -234,7 +258,7 @@ async def db_get_due_notes(today_date) -> List[dict]:
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags
                 FROM user_notes
                 WHERE cycle = 'hangngay' OR target_date <= $1
                 ORDER BY id DESC;
@@ -376,6 +400,50 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
     return f"Lỗi phân tích ảnh từ các model Vision: {last_error}"
 
 
+async def ask_ai_transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+    """Chuyển đổi âm thanh giọng nói (voice) thành văn bản qua Groq Whisper."""
+    if not GROQ_API_KEY:
+        return ""
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    
+    data = web.FormData()
+    data.add_field("file", audio_bytes, filename=filename, content_type="audio/ogg")
+    data.add_field("model", "whisper-large-v3-turbo")
+    data.add_field("language", "vi")
+
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    try:
+        async with GLOBAL_SESSION.post(url, data=data, headers=headers, timeout=30) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                return result.get("text", "").strip()
+            else:
+                logger.error(f"Lỗi Whisper ({resp.status}): {await resp.text()}")
+    except Exception as e:
+        logger.error(f"Lỗi kết nối Whisper Groq: {e}")
+    return ""
+
+
+async def evaluate_active_recall_answer(note_content: str, user_answer: str) -> (str, int):
+    """AI so sánh câu trả lời của người dùng với nội dung bài học gốc, chấm điểm và nhận xét."""
+    prompt = (
+        f"Bạn là người kiểm tra kiến thức công tâm và tận tâm.\n\n"
+        f"--- NỘI DUNG BÀI HỌC GỐC ---\n{note_content}\n"
+        f"--- CÂU TRẢ LỜI CỦA NGƯỜI HỌC ---\n{user_answer}\n\n"
+        f"YÊU CẦU ĐÁNH GIÁ:\n"
+        f"1. So sánh chi tiết câu trả lời với nội dung gốc.\n"
+        f"2. Nêu rõ: Ý đúng/chuẩn xác đã nắm được; Ý còn thiếu hoặc hiểu chưa sát.\n"
+        f"3. Cho điểm từ 1 đến 10 theo mức độ hiểu sâu.\n"
+        f"4. Trả về đúng định dạng sau ở cuối phản hồi: [DIEM: X] (với X là số nguyên từ 1 đến 10).\n"
+        f"Trình bày chuyên nghiệp, động viên, dùng tiếng Việt ngắn gọn, súc tích."
+    )
+    feedback = await ask_ai(prompt)
+    score_match = re.search(r"\[DIEM:\s*(\d+)\]", feedback)
+    score = int(score_match.group(1)) if score_match else 7
+    clean_feedback = re.sub(r"\[DIEM:\s*\d+\]", "", feedback).strip()
+    return clean_feedback, score
+
+
 # --- BỘ ĐỌC TÀI LIỆU VĂN PHÒNG ---
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -439,25 +507,24 @@ async def process_document_content(file_name: str, text_content: str) -> str:
 
 HELP_MESSAGE = (
     "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP (SUPABASE CLOUD)**\n\n"
-    "📝 **1. LƯU BÀI HỌC VÀ CHU KỲ NHẮC LẶP:**\n"
-    "• `/save <nội dung>`: Lưu bài theo chu kỳ Spaced Repetition (1 - 3 - 7 - 14 - 30 ngày)\n"
-    "• `/save trongngay <nội dung>`: Nhắc kiểm tra ngay hôm nay\n"
-    "• `/save 3ngay <nội dung>`: Nhắc kiểm tra sau 3 ngày\n"
+    "📝 **1. LƯU BÀI HỌC VÀ GẮN NHÃN (TAGS):**\n"
+    "• `/save #quytrinh #vandon <nội dung>`: Lưu bài và gắn nhãn theo chủ đề\n"
+    "• `/save 3ngay #cod <nội dung>`: Tự do chọn thời gian ôn tập và gắn thẻ\n"
     "• `/save hangngay <nội dung>`: Nhắc đều đặn mỗi ngày\n\n"
-    "📎 **2. ĐỌC TÀI LIỆU & TẢI LẠI FILE GỐC:**\n"
-    "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** để bot tự tóm tắt và tự động lưu mã file\n"
-    "• Gửi **Ảnh chụp tài liệu/sách** để OCR và tạo câu hỏi tự kiểm tra\n"
+    "🧠 **2. ÔN TẬP & AI CHẤM ĐIỂM RECALL:**\n"
+    "• `/ontap` hoặc `/ontap <id>`: Tạo câu hỏi ôn tập\n"
+    "• Bấm nút **'✍️ Trả lời câu hỏi'** rồi gửi văn bản hoặc tin nhắn thoại (voice): AI sẽ tự chấm điểm và đánh giá ý đúng/thiếu!\n\n"
+    "📎 **3. ĐỌC TÀI LIỆU & TẢI LẠI FILE GỐC:**\n"
+    "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** để bot tự tóm tắt\n"
+    "• Gửi **Ảnh chụp tài liệu** để OCR và tạo câu hỏi tự kiểm tra\n"
     "• `/getfile <id>`: Yêu cầu bot gửi trả lại file gốc đính kèm của bài học\n\n"
-    "🗑️ **3. XÓA BÀI HỌC & LÀM MỚI BỘ NHỚ:**\n"
-    "• `/xoa <id>`: Xóa chọn lọc 1 bài học theo mã ID (Ví dụ: `/xoa 3`)\n"
-    "• `/xoatatca`: Xóa sạch toàn bộ bài học và tệp đã lưu để bắt đầu lại\n\n"
-    "🤖 **4. TRÍCH XUẤT KIẾN THỨC BẰNG AI:**\n"
-    "• Bạn có thể hỏi tự nhiên bất cứ lúc nào! *(Ví dụ: \"Hôm trước tôi lưu những gì về kiểm kê bưu cục?\", \"Tóm tắt các tài liệu tôi đã gửi\")*\n"
-    "• AI sẽ tự động tra cứu kho dữ liệu Supabase và giải đáp chính xác.\n\n"
-    "🔍 **5. TRA CỨU & ÔN TẬP:**\n"
-    "• `/list`: Xem danh sách các bài học đã lưu trên Cloud\n"
-    "• `/search <từ khóa>`: Tìm kiếm bài học theo từ khóa\n"
-    "• `/ontap` hoặc `/ontap <id>`: Ôn tập ngay tức thì với AI"
+    "🔍 **4. TRA CỨU THEO CHUYÊN MỤC:**\n"
+    "• `/list`: Xem tất cả bài học đã lưu\n"
+    "• `/list #quytrinh`: Lọc riêng các bài thuộc chuyên mục quy trình\n"
+    "• `/search <từ khóa>`: Tìm kiếm theo từ khóa\n\n"
+    "🗑️ **5. QUẢN LÝ DỮ LIỆU:**\n"
+    "• `/xoa <id>`: Xóa chọn lọc 1 bài học theo mã ID\n"
+    "• `/xoatatca`: Xóa sạch toàn bộ bộ nhớ có xác nhận an toàn"
 )
 
 
@@ -466,7 +533,7 @@ HELP_MESSAGE = (
 async def handle_save_command_core(platform: str, user_id: str, args_text: str) -> str:
     args = args_text.strip().split()
     if not args:
-        return "⚠️ Cú pháp: `/save [chu_kỳ] <nội dung>`\nVí dụ: `/save 3ngay Quy trình giao nhận bưu cục`"
+        return "⚠️ Cú pháp: `/save [chu_kỳ] [#nhãn] <nội dung>`\nVí dụ: `/save 3ngay #quytrinh #vandon Kiểm tra gói hàng bưu cục`"
 
     now = datetime.now(LOCAL_TZ)
     today_date = now.date()
@@ -484,13 +551,16 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
 
     if first_arg in mode_map:
         cycle_type, offset_days, cycle_label = mode_map[first_arg]
-        content = " ".join(args[1:]).strip()
+        raw_content = " ".join(args[1:]).strip()
     else:
         cycle_type, offset_days, cycle_label = ("spaced", 0, "Lộ trình ghi nhớ bền vững (1-3-7-14-30 ngày)")
-        content = " ".join(args).strip()
+        raw_content = " ".join(args).strip()
 
-    if not content:
+    if not raw_content:
         return "⚠️ Bạn chưa nhập nội dung kiến thức cần ghi nhớ!"
+
+    # Tự động trích xuất các hashtag
+    tags = extract_hashtags(raw_content)
 
     if cycle_type == "spaced":
         target_date = today_date + timedelta(days=SPACED_INTERVALS[0])
@@ -499,14 +569,16 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
     else:
         target_date = today_date
 
-    note_id = await db_save_note(platform, user_id, content, cycle_type, cycle_label, target_date)
+    note_id = await db_save_note(platform, user_id, raw_content, cycle_type, cycle_label, target_date, tags=tags)
     if not note_id:
         return "❌ Lỗi lưu dữ liệu vào Supabase! Hãy kiểm tra lại kết nối database."
 
+    tags_display = f"\n🏷️ *Nhãn chuyên mục:* `{' '.join(tags)}`" if tags else ""
+
     return (
         f"✅ **Đã lưu kiến thức bền vững [Mã #{note_id}]!** ☁️\n\n"
-        f"📝 *Nội dung:* {content}\n"
-        f"⏰ *Chế độ:* **{cycle_label}**\n"
+        f"📝 *Nội dung:* {raw_content}\n"
+        f"⏰ *Chế độ:* **{cycle_label}**{tags_display}\n"
         f"📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`\n\n"
         f"💡 Ôn ngay: `/ontap {note_id}`"
     )
@@ -536,27 +608,29 @@ async def handle_ontap_command_core(platform: str, user_id: str, arg_id: str) ->
     ai_question = await ask_ai(prompt)
     created_str = target_note["created_at"].strftime("%d/%m/%Y") if target_note.get("created_at") else ""
     file_info = f"\n📎 *Tệp đính kèm:* `{target_note['file_name']}` (Tải lại: `/getfile {target_note['id']}`)" if target_note.get("file_id") else ""
+    tags_str = f"\n🏷️ *Nhãn:* `{' '.join(target_note.get('tags', []))}`" if target_note.get("tags") else ""
 
     reply = (
-        f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**{file_info}\n\n"
+        f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**{tags_str}{file_info}\n\n"
         f"{ai_question}"
     )
     return reply, target_note["id"]
 
 
-async def handle_list_notes_core(platform: str, user_id: str) -> str:
-    notes = await db_get_user_notes(platform, user_id, limit=10)
+async def handle_list_notes_core(platform: str, user_id: str, tag_filter: Optional[str] = None) -> str:
+    notes = await db_get_user_notes(platform, user_id, limit=10, tag_filter=tag_filter)
+    header_extra = f" thuộc nhãn `{tag_filter}`" if tag_filter else ""
     if not notes:
-        return "Danh sách học tập của bạn trên Supabase đang trống. Hãy dùng `/save` hoặc gửi tài liệu để thêm bài!"
+        return f"Danh sách học tập của bạn trên Supabase{header_extra} đang trống!"
 
-    reply = f"📚 **Danh sách {len(notes)} bài học gần nhất đã lưu trên Cloud:**\n\n"
+    reply = f"📚 **Danh sách {len(notes)} bài học gần nhất{header_extra}:**\n\n"
     for item in notes:
         n_id = item.get("id")
         t_date = item.get("target_date")
         t_date_str = t_date.strftime("%d/%m/%Y") if t_date else "Đã thuộc bền vững"
         file_tag = f" 📎 `[{item.get('file_name')}]`" if item.get("file_id") else ""
-        source_badge = "📱 Telegram" if item.get("platform") == "telegram" else "💼 Lark"
-        reply += f"🔹 **[#{n_id}]** ({source_badge}){file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
+        tags_tag = f" 🏷️`{' '.join(item.get('tags', []))}`" if item.get("tags") else ""
+        reply += f"🔹 **[#{n_id}]**{tags_tag}{file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
     return reply
 
 
@@ -573,7 +647,8 @@ async def handle_search_notes_core(platform: str, user_id: str, keyword: str) ->
     for item in matched:
         created_str = item["created_at"].strftime("%d/%m/%Y") if item.get("created_at") else ""
         file_hint = f" (File: `/getfile {item['id']}`)" if item.get("file_id") else ""
-        reply += f"📌 **[#{item['id']}]** `({created_str})`{file_hint}:\n{item['content']}\n\n"
+        tags_str = f" 🏷️`{' '.join(item.get('tags', []))}`" if item.get("tags") else ""
+        reply += f"📌 **[#{item['id']}]** `({created_str})`{tags_str}{file_hint}:\n{item['content']}\n\n"
     return reply
 
 
@@ -581,6 +656,9 @@ async def handle_search_notes_core(platform: str, user_id: str, keyword: str) ->
 
 def make_recall_keyboard(note_id: int) -> InlineKeyboardMarkup:
     buttons = [
+        [
+            InlineKeyboardButton("✍️ Trả lời câu hỏi (AI Chấm)", callback_data=f"recall_answer_{note_id}"),
+        ],
         [
             InlineKeyboardButton("✅ Đã nhớ rõ", callback_data=f"recall_ok_{note_id}"),
             InlineKeyboardButton("🔄 Cần ôn lại", callback_data=f"recall_retry_{note_id}"),
@@ -595,8 +673,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "Phong"
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
-        f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã kết nối cơ sở dữ liệu Supabase, "
-        f"hỗ trợ lưu trữ kiến thức vĩnh viễn, đồng bộ dữ liệu thời gian thực giữa Telegram và Lark Suite! 📚💡"
+        f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã nâng cấp:\n"
+        f"🏷️ **Hashtag phân loại**: Lưu kèm `#quytrinh`, `#vandon` và lọc qua `/list #nhãn`\n"
+        f"🧠 **AI Chấm Điểm Recall**: Gửi tin nhắn văn bản hoặc giọng nói (voice) để AI đánh giá mức độ hiểu sâu!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
@@ -625,7 +704,8 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    res = await handle_list_notes_core("telegram", chat_id)
+    tag_filter = context.args[0] if context.args else None
+    res = await handle_list_notes_core("telegram", chat_id, tag_filter)
     await update.message.reply_text(res, parse_mode="Markdown")
 
 
@@ -656,7 +736,7 @@ async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = note.get("file_id")
     file_name = note.get("file_name", "document")
     if not file_id:
-        await update.message.reply_text(f"ℹ️ Bài học #{note_id} không có tệp đính kèm gốc (được lưu dưới dạng văn bản thuần).", parse_mode="Markdown")
+        await update.message.reply_text(f"ℹ️ Bài học #{note_id} không có tệp đính kèm gốc.", parse_mode="Markdown")
         return
 
     await update.message.reply_text(f"📤 Đang gửi lại tệp gốc `{file_name}`...")
@@ -674,12 +754,7 @@ async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh xóa chọn lọc: /xoa <id>"""
     chat_id = str(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text(
-            "⚠️ Vui lòng nhập mã bài học cần xóa.\n"
-            "Ví dụ: `/xoa 3`\n"
-            "💡 Mẹo: Gõ `/list` để xem danh sách mã bài học của bạn.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Vui lòng nhập mã bài học cần xóa. Ví dụ: `/xoa 3`", parse_mode="Markdown")
         return
 
     try:
@@ -703,8 +778,8 @@ async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if arg != "xacnhan":
         msg = (
             "⚠️ **CẢNH BÁO XÓA BỘ NHỚ!**\n\n"
-            "Lệnh này sẽ **xóa sạch toàn bộ bài học, tệp và ảnh** bạn đã lưu trên cơ sở dữ liệu Cloud.\n\n"
-            "👉 Để chắc chắn thực hiện, vui lòng gõ đúng cú pháp:\n"
+            "Lệnh này sẽ **xóa sạch toàn bộ bài học, tệp và ảnh** trên Cloud.\n\n"
+            "👉 Vui lòng gõ đúng cú pháp để xác nhận:\n"
             "`/xoatatca xacnhan`"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -714,11 +789,11 @@ async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text(
             "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học trên Cloud!**\n"
-            "Bộ nhớ đã được làm mới hoàn toàn. Bạn có thể dùng `/save` để bắt đầu lưu kiến thức mới từ đầu! 🚀",
+            "Bộ nhớ đã được làm mới hoàn toàn. Bạn có thể dùng `/save` để bắt đầu lại! 🚀",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("❌ Lỗi khi thực hiện xóa dữ liệu. Vui lòng thử lại sau.")
+        await update.message.reply_text("❌ Lỗi khi thực hiện xóa dữ liệu.")
 
 
 async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -727,7 +802,21 @@ async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAUL
     data_str = query.data
     chat_id = str(update.effective_chat.id)
 
-    if data_str.startswith("recall_ok_"):
+    if data_str.startswith("recall_answer_"):
+        n_id = int(data_str.split("_")[-1])
+        ACTIVE_RECALL_SESSIONS[chat_id] = n_id
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text=(
+                f"✍️ **Đang chờ câu trả lời cho bài [#{n_id}]!**\n\n"
+                "👉 Bạn hãy gửi câu trả lời bằng **tin nhắn văn bản** hoặc **bấm giữ ghi âm Voice (giọng nói)**.\n"
+                "Groq AI sẽ tự động lắng nghe, đối chiếu với kiến thức gốc và chấm điểm cho bạn! 🎯"
+            ),
+            parse_mode="Markdown"
+        )
+
+    elif data_str.startswith("recall_ok_"):
         n_id = int(data_str.split("_")[-1])
         msg = await db_update_progress(n_id, remembered=True)
         await query.edit_message_reply_markup(reply_markup=None)
@@ -740,13 +829,88 @@ async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAUL
         await context.bot.send_message(chat_id=int(chat_id), text=msg)
 
 
+async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý tin nhắn âm thanh Voice trả lời Active Recall qua Groq Whisper."""
+    chat_id = str(update.effective_chat.id)
+    voice = update.message.voice
+    if not voice:
+        return
+
+    status_msg = await update.message.reply_text("🎙️ Đang nghe và chuyển đổi giọng nói của bạn qua Whisper AI...")
+    try:
+        tg_file = await voice.get_file()
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        audio_bytes = buf.getvalue()
+
+        transcribed_text = await ask_ai_transcribe_audio(audio_bytes)
+        if not transcribed_text:
+            await status_msg.edit_text("⚠️ Không nhận diện được giọng nói hoặc âm thanh quá nhỏ.")
+            return
+
+        await status_msg.edit_text(f"🗣️ *Bạn đã nói:* \"{transcribed_text}\"\n\n🤖 Đang đối chiếu bài học và chấm điểm...", parse_mode="Markdown")
+
+        # Kiểm tra xem có đang trong phiên trả lời ôn tập không
+        if chat_id in ACTIVE_RECALL_SESSIONS:
+            target_id = ACTIVE_RECALL_SESSIONS.pop(chat_id)
+            note = await db_get_note_by_id(target_id)
+            if note:
+                feedback, score = await evaluate_active_recall_answer(note["content"], transcribed_text)
+                is_passed = score >= 7
+                progress_msg = await db_update_progress(target_id, remembered=is_passed)
+                
+                score_badge = "🌟 ĐẠT YÊU CẦU" if is_passed else "🔄 CẦN CỦNG CỐ THÊM"
+                reply_text = (
+                    f"🎯 **KẾT QUẢ CHẤM ĐIỂM ACTIVE RECALL [Bài #{target_id}]**\n"
+                    f"📊 **Điểm số:** `{score}/10` ({score_badge})\n\n"
+                    f"{feedback}\n\n"
+                    f"📈 **Cập nhật lộ trình:** {progress_msg}"
+                )
+                await update.message.reply_text(reply_text)
+                return
+
+        # Nếu không trong phiên ôn tập, chuyển sang xử lý AI đối thoại bình thường
+        recent_notes = await db_get_user_notes("telegram", chat_id, limit=10)
+        context_data = ""
+        if recent_notes:
+            for n in recent_notes:
+                context_data += f"- [Mã #{n['id']}]: {n['content']}\n"
+        prompt = f"Người dùng nói: '{transcribed_text}'. Hãy phản hồi thân thiện dựa trên kho kiến thức sau nếu liên quan:\n{context_data}"
+        ans = await ask_ai(prompt)
+        await update.message.reply_text(ans)
+    except Exception as e:
+        logger.error(f"Lỗi voice Telegram: {e}")
+        await status_msg.edit_text(f"❌ Lỗi xử lý âm thanh: {e}")
+
+
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý trò chuyện thông thường: Tự động trích xuất dữ liệu từ Supabase đưa vào ngữ cảnh AI."""
+    """Xử lý trò chuyện hoặc tiếp nhận câu trả lời Active Recall dạng văn bản."""
     user_text = update.message.text.strip()
     chat_id = str(update.effective_chat.id)
     raw_name = update.effective_user.first_name or "Phong"
     call_name = "Phong" if "phong" in raw_name.lower() or raw_name in ["Bạn", "User"] else raw_name
 
+    # 1. Ưu tiên xử lý nếu đang trong phiên chờ trả lời Active Recall
+    if chat_id in ACTIVE_RECALL_SESSIONS:
+        target_id = ACTIVE_RECALL_SESSIONS.pop(chat_id)
+        note = await db_get_note_by_id(target_id)
+        if note:
+            await update.message.chat.send_action("typing")
+            feedback, score = await evaluate_active_recall_answer(note["content"], user_text)
+            is_passed = score >= 7
+            progress_msg = await db_update_progress(target_id, remembered=is_passed)
+            score_badge = "🌟 ĐẠT YÊU CẦU" if is_passed else "🔄 CẦN CỦNG CỐ THÊM"
+
+            reply_text = (
+                f"🎯 **KẾT QUẢ CHẤM ĐIỂM ACTIVE RECALL [Bài #{target_id}]**\n"
+                f"📊 **Điểm số:** `{score}/10` ({score_badge})\n\n"
+                f"{feedback}\n\n"
+                f"📈 **Cập nhật lộ trình:** {progress_msg}"
+            )
+            await update.message.reply_text(reply_text)
+            return
+
+    # 2. Xử lý hội thoại tự nhiên thông thường
     greetings = ["hi", "hello", "xin chào", "chào", "chao", "alo", "start", "/start"]
     if user_text.lower() in greetings:
         await update.message.reply_text(
@@ -764,7 +928,8 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
         for n in recent_notes:
             c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
             f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
-            context_data += f"- [Mã #{n['id']}] (Ngày {c_date}){f_note}: {n['content']}\n"
+            t_note = f" [Thẻ: {' '.join(n.get('tags', []))}]" if n.get("tags") else ""
+            context_data += f"- [Mã #{n['id']}]{t_note} (Ngày {c_date}){f_note}: {n['content']}\n"
     else:
         context_data = "Người dùng hiện chưa lưu bài học nào trong cơ sở dữ liệu.\n"
 
@@ -815,7 +980,8 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
                 cycle_label="Hình ảnh tài liệu",
                 target_date=datetime.now(LOCAL_TZ).date(),
                 file_id=doc.file_id,
-                file_name=file_name
+                file_name=file_name,
+                tags=["#hinhanh", "#tailieu"]
             )
             await status_msg.edit_text(
                 f"🖼️ **PHÂN TÍCH HÌNH ẢNH [Mã #{note_id}]:**\n\n{analysis}\n\n"
@@ -827,6 +993,7 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
             return
 
         analysis = await process_document_content(file_name, txt)
+        doc_tags = [f"#{ext}"]
         note_id = await db_save_note(
             platform="telegram",
             user_id=chat_id,
@@ -835,7 +1002,8 @@ async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT
             cycle_label="Tài liệu văn phòng",
             target_date=datetime.now(LOCAL_TZ).date(),
             file_id=doc.file_id,
-            file_name=file_name
+            file_name=file_name,
+            tags=doc_tags
         )
         await status_msg.edit_text(
             f"📄 **KẾT QUẢ ĐỌC TÀI LIỆU [Mã #{note_id}]:** `{file_name}`\n\n"
@@ -869,7 +1037,8 @@ async def telegram_handle_photo(update: Update, context: ContextTypes.DEFAULT_TY
             cycle_label="Ảnh chụp tài liệu",
             target_date=datetime.now(LOCAL_TZ).date(),
             file_id=photo.file_id,
-            file_name="photo.jpg"
+            file_name="photo.jpg",
+            tags=["#anhchup", "#ocr"]
         )
         await status_msg.edit_text(
             f"🖼️ **KẾT QUẢ ĐỌC HÌNH ẢNH [Mã #{note_id}]:**\n\n{analysis}\n\n"
@@ -1048,6 +1217,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
             txt = extract_text_from_excel(file_bytes)
 
         analysis = await process_document_content(file_name, txt)
+        doc_tags = [f"#{ext}"]
         note_id = await db_save_note(
             platform="lark",
             user_id=open_id,
@@ -1056,7 +1226,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
             cycle_label="Tài liệu văn phòng",
             target_date=datetime.now(LOCAL_TZ).date(),
             file_id=file_key,
-            file_name=file_name
+            file_name=file_name,
+            tags=doc_tags
         )
         await send_lark_message(open_id, f"📄 **KẾT QUẢ ĐỌC TÀI LIỆU [Mã #{note_id}]:** `{file_name}`\n\n{analysis}")
         return
@@ -1074,7 +1245,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
             cycle_label="Ảnh chụp tài liệu",
             target_date=datetime.now(LOCAL_TZ).date(),
             file_id=image_key,
-            file_name="image.jpg"
+            file_name="image.jpg",
+            tags=["#anhchup", "#ocr"]
         )
         await send_lark_message(open_id, f"🖼️ **KẾT QUẢ ĐỌC HÌNH ẢNH [Mã #{note_id}]:**\n\n{analysis}")
         return
@@ -1082,6 +1254,24 @@ async def dispatch_lark_event(open_id: str, message: dict):
     raw = content_json.get("text", "").strip()
     if not raw:
         return
+
+    # Kiểm tra phiên chờ trả lời Active Recall trên Lark
+    if open_id in ACTIVE_RECALL_SESSIONS:
+        target_id = ACTIVE_RECALL_SESSIONS.pop(open_id)
+        note = await db_get_note_by_id(target_id)
+        if note:
+            feedback, score = await evaluate_active_recall_answer(note["content"], raw)
+            is_passed = score >= 7
+            progress_msg = await db_update_progress(target_id, remembered=is_passed)
+            score_badge = "🌟 ĐẠT YÊU CẦU" if is_passed else "🔄 CẦN CỦNG CỐ THÊM"
+            res = (
+                f"🎯 **KẾT QUẢ CHẤM ĐIỂM ACTIVE RECALL [Bài #{target_id}]**\n"
+                f"📊 **Điểm số:** `{score}/10` ({score_badge})\n\n"
+                f"{feedback}\n\n"
+                f"📈 **Cập nhật lộ trình:** {progress_msg}"
+            )
+            await send_lark_message(open_id, res)
+            return
 
     if raw.lower() in ["/start", "hi", "hello", "chào", "chao"]:
         reply = "Chào Phong! 🌟 Chúc bạn một ngày tràn đầy năng lượng và cảm hứng học tập! 🚀💡\n\n" + HELP_MESSAGE
@@ -1091,8 +1281,10 @@ async def dispatch_lark_event(open_id: str, message: dict):
     elif raw.startswith("/save"):
         reply = await handle_save_command_core("lark", open_id, raw[5:].strip())
         await send_lark_message(open_id, reply)
-    elif raw == "/list":
-        reply = await handle_list_notes_core("lark", open_id)
+    elif raw.startswith("/list"):
+        parts = raw.split()
+        tag_filter = parts[1] if len(parts) > 1 else None
+        reply = await handle_list_notes_core("lark", open_id, tag_filter)
         await send_lark_message(open_id, reply)
     elif raw.startswith("/search"):
         reply = await handle_search_notes_core("lark", open_id, raw[7:].strip())
@@ -1100,7 +1292,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
     elif raw.startswith("/ontap"):
         reply, note_id = await handle_ontap_command_core("lark", open_id, raw[6:].strip())
         if note_id:
-            await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply, note_id)
+            ACTIVE_RECALL_SESSIONS[open_id] = note_id
+            await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply + "\n\n*(Nhắn lại câu trả lời vào đây để AI chấm điểm)*", note_id)
         else:
             await send_lark_message(open_id, reply)
     elif raw.startswith("/xoa ") or raw.startswith("/del "):
@@ -1129,7 +1322,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
             for n in recent_notes:
                 c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
                 f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
-                context_data += f"- [Mã #{n['id']}] (Ngày {c_date}){f_note}: {n['content']}\n"
+                t_note = f" [Thẻ: {' '.join(n.get('tags', []))}]" if n.get("tags") else ""
+                context_data += f"- [Mã #{n['id']}]{t_note} (Ngày {c_date}){f_note}: {n['content']}\n"
         else:
             context_data = "Chưa có bài học nào được lưu.\n"
 
@@ -1161,7 +1355,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
             "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
-            "`/save [chu_kỳ] <nội dung>` hoặc gửi file tài liệu để lưu vào Supabase Cloud nhé!"
+            "`/save [chu_kỳ] [#nhãn] <nội dung>` hoặc gửi file tài liệu để lưu vào Supabase Cloud nhé!"
         )
         try:
             if DB_POOL:
@@ -1238,9 +1432,9 @@ async def run_web_server():
 async def setup_bot_commands(application):
     commands = [
         BotCommand("help", "Bảng hướng dẫn lệnh mẫu"),
-        BotCommand("save", "Lưu bài học theo chu kỳ Spaced Repetition"),
-        BotCommand("ontap", "Ôn tập kiến thức tức thì qua AI"),
-        BotCommand("list", "Xem các bài học đã ghi nhận"),
+        BotCommand("save", "Lưu bài học kèm nhãn (#nhan)"),
+        BotCommand("ontap", "Ôn tập kiến thức & AI chấm điểm"),
+        BotCommand("list", "Xem danh sách hoặc lọc nhãn (/list #nhan)"),
         BotCommand("search", "Tìm bài học cũ theo từ khóa"),
         BotCommand("getfile", "Tải lại tệp gốc đính kèm (/getfile <id>)"),
         BotCommand("xoa", "Xóa 1 bài học theo mã ID (/xoa <id>)"),
@@ -1284,7 +1478,8 @@ async def run_bot():
     application.add_handler(CommandHandler("xoahet", xoatatca_command))
     application.add_handler(CallbackQueryHandler(telegram_callback_handler))
 
-    # Đăng ký nhận file và hình ảnh
+    # Đăng ký nhận file, hình ảnh, âm thanh voice và text
+    application.add_handler(MessageHandler(filters.VOICE, handle_telegram_voice))
     application.add_handler(MessageHandler(filters.PHOTO, telegram_handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, telegram_handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_with_groq))
