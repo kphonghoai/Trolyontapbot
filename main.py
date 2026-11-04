@@ -1,6 +1,8 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Hẹn Giờ Tùy Chọn
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Push Notification Ưu Tiên Cao (Phương Án A)
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
+- Tích hợp Push Notification ưu tiên cao: Buộc rung & phát chuông, tự động Ghim tin nhắn (Pin) trên Telegram
+- Lark Suite kích hoạt Thẻ cảnh báo màu đỏ (Red Template) kèm rung chuông nổi bật
 - Hỗ trợ nhắc nhở theo khung giờ / ngày giờ tùy chọn (/nhac <id> <giờ> hoặc /save HH:MM ...)
 - Hỗ trợ gắn nhãn phân loại (#quytrinh, #vandon, #cod...) và lọc theo thẻ (/list #nhan)
 - Hỗ trợ Active Recall đối thoại: AI chấm điểm câu trả lời văn bản & voice trực tiếp
@@ -569,10 +571,11 @@ async def process_document_content(file_name: str, text_content: str) -> str:
 
 HELP_MESSAGE = (
     "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP (SUPABASE CLOUD)**\n\n"
-    "⏰ **1. HẸN GIỜ NHẮC TÙY CHỌN (MỚI):**\n"
+    "🚨 **1. PUSH NOTIFICATION & HẸN GIỜ (MỨC ĐỘ ƯU TIÊN CAO):**\n"
     "• `/save 14:30 #vandon Kiểm tra gói hàng`: Đặt nhắc chính xác lúc 14:30 hôm nay\n"
     "• `/save 05/11 09:00 #quytrinh Họp bưu cục`: Đặt nhắc ngày và giờ cụ thể\n"
-    "• `/nhac <id> <thời gian>`: Đặt giờ nhắc cho bài đã có (Ví dụ: `/nhac 8 16:00` hoặc `/nhac 8 05/11 08:30`)\n\n"
+    "• `/nhac <id> <thời gian>`: Đặt giờ nhắc cho bài đã có (Ví dụ: `/nhac 8 16:00` hoặc `/nhac 8 05/11 08:30`)\n"
+    "*(⚡ Khi đến giờ, bot sẽ tự động rung chuông và Ghim tin nhắn để đánh thức màn hình khóa)*\n\n"
     "📝 **2. LƯU BÀI HỌC VÀ GẮN NHÃN (TAGS):**\n"
     "• `/save #quytrinh #vandon <nội dung>`: Lưu bài theo lộ trình Spaced Repetition\n"
     "• `/save 3ngay #cod <nội dung>`: Lưu bài ôn sau 3 ngày\n"
@@ -672,7 +675,7 @@ async def handle_save_command_core(platform: str, user_id: str, args_text: str) 
         return "❌ Lỗi lưu dữ liệu vào Supabase! Hãy kiểm tra lại kết nối database."
 
     tags_display = f"\n🏷️ *Nhãn chuyên mục:* `{' '.join(tags)}`" if tags else ""
-    remind_display = f"\n⏰ *Thời gian hẹn nhắc:* `{remind_at.strftime('%H:%M ngày %d/%m/%Y')}`" if remind_at else f"\n📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`"
+    remind_display = f"\n⏰ *Thời gian hẹn nhắc:* `{remind_at.strftime('%H:%M ngày %d/%m/%Y')}` *(Bật Push Notification)*" if remind_at else f"\n📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`"
 
     return (
         f"✅ **Đã lưu kiến thức [Mã #{note_id}]!** ☁️\n\n"
@@ -713,8 +716,8 @@ async def handle_nhac_command_core(platform: str, user_id: str, args_text: str) 
         return (
             f"⏰ **Đã lên lịch hẹn nhắc bài [#{note_id}] thành công!**\n\n"
             f"📖 *Nội dung:* {note['content'][:120]}...\n"
-            f"🔔 *Thời điểm nhắc:* `{parsed_dt.strftime('%H:%M ngày %d/%m/%Y')}`\n\n"
-            f"Bot sẽ tự động gửi câu hỏi Active Recall cho bạn vào đúng khung giờ này! 🎯"
+            f"🔔 *Thời điểm nhắc:* `{parsed_dt.strftime('%H:%M ngày %d/%m/%Y')}`\n"
+            f"🚨 *Chế độ:* **Push Notification Ưu Tiên Cao (Tự động Ghim tin nhắn & Rung chuông)** 🎯"
         )
     return "❌ Lỗi khi cập nhật lịch hẹn lên cơ sở dữ liệu."
 
@@ -812,6 +815,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
         f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã nâng cấp:\n"
+        f"🚨 **Push Notification Ưu Tiên Cao**: Hẹn giờ nhắc tự động bật chuông & Ghim tin nhắn\n"
         f"⏰ **Hẹn giờ tùy chọn**: `/save 14:30 <nội dung>` hoặc `/nhac <id> 15:00`\n"
         f"🏷️ **Hashtag phân loại**: Lưu kèm `#quytrinh`, `#vandon` và lọc qua `/list #nhãn`\n"
         f"🧠 **AI Chấm Điểm Recall**: Gửi văn bản hoặc tin nhắn thoại (voice) để AI đánh giá mức độ hiểu sâu!"
@@ -1238,7 +1242,11 @@ async def send_lark_message(open_id: str, text: str):
         logger.error(f"Lỗi mạng khi gửi tin Lark: {e}")
 
 
-async def send_lark_interactive_card(open_id: str, title: str, content: str, note_id: int):
+async def send_lark_interactive_card(open_id: str, title: str, content: str, note_id: int, header_color: str = "blue"):
+    """
+    Gửi thẻ tương tác Lark. 
+    header_color: 'red' (cảnh báo/ưu tiên cao), 'blue' (thông thường), 'orange' (nhắc nhở).
+    """
     token = await get_lark_tenant_token()
     if not token:
         return
@@ -1247,7 +1255,7 @@ async def send_lark_interactive_card(open_id: str, title: str, content: str, not
         "config": {"wide_screen_mode": True},
         "header": {
             "title": {"tag": "plain_text", "content": title},
-            "template": "blue",
+            "template": header_color,
         },
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": content}},
@@ -1435,7 +1443,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
         reply, note_id = await handle_ontap_command_core("lark", open_id, raw[6:].strip())
         if note_id:
             ACTIVE_RECALL_SESSIONS[open_id] = note_id
-            await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply + "\n\n*(Nhắn lại câu trả lời vào đây để AI chấm điểm)*", note_id)
+            await send_lark_interactive_card(open_id, f"📚 Ôn tập bài #{note_id}", reply + "\n\n*(Nhắn lại câu trả lời vào đây để AI chấm điểm)*", note_id, header_color="blue")
         else:
             await send_lark_message(open_id, reply)
     elif raw.startswith("/xoa ") or raw.startswith("/del "):
@@ -1481,14 +1489,14 @@ async def dispatch_lark_event(open_id: str, message: dict):
         await send_lark_message(open_id, reply)
 
 
-# --- BỘ LẬP LỊCH TỰ ĐỘNG (QUÉT MỖI PHÚT) ---
+# --- BỘ LẬP LỊCH TỰ ĐỘNG & PUSH NOTIFICATION ƯU TIÊN CAO (QUÉT MỖI PHÚT) ---
 
 async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
     today_date = now.date()
 
-    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at)
+    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at) -> PUSH NOTIFICATION KHẨN CẤP
     custom_due = await db_get_custom_remind_notes(now)
     for note in custom_due:
         n_id = note["id"]
@@ -1500,7 +1508,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
             "Hãy tạo 1 câu hỏi ôn tập Active Recall ngắn gọn bằng tiếng Việt để kiểm tra phản xạ ngay lúc này."
         )
         ai_q = await ask_ai(prompt)
-        title = "⏰ **Thông Báo Nhắc Nhở Hẹn Giờ!** 🔔✨"
+        title = "🚨 **CẢNH BÁO NHẮC NHỞ HẸN GIỜ!** 🔔⚡"
         body = (
             f"{title}\n\n"
             f"📖 *Nội dung bài #{n_id}:* {note['content']}\n\n"
@@ -1509,14 +1517,25 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             if platform == "telegram":
-                await context.bot.send_message(
+                # Push Notification mức cao: Bật chuông/rung và tự động Ghim tin nhắn
+                sent_msg = await context.bot.send_message(
                     chat_id=int(user_id),
                     text=body,
                     reply_markup=make_recall_keyboard(n_id),
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    disable_notification=False  # Buộc phát chuông và rung
                 )
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=int(user_id),
+                        message_id=sent_msg.message_id,
+                        disable_notification=False
+                    )
+                except Exception as pin_err:
+                    logger.warning(f"Không thể ghim tin nhắn #{n_id}: {pin_err}")
             else:
-                await send_lark_interactive_card(user_id, title, body, n_id)
+                # Lark Suite: Đẩy thẻ cảnh báo màu đỏ (Red Template)
+                await send_lark_interactive_card(user_id, title, body, n_id, header_color="red")
             
             # Sau khi nhắc xong, hủy mốc hẹn giờ để không nhắc lặp lại
             await db_update_remind_time(n_id, None)
@@ -1537,7 +1556,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     for u in users:
                         p, uid = u["platform"], u["user_id"]
                         if p == "telegram":
-                            await context.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown")
+                            await context.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown", disable_notification=False)
                         else:
                             await send_lark_message(uid, msg)
         except Exception as e:
@@ -1577,14 +1596,19 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         n_id = selected_note["id"]
         try:
             if platform == "telegram":
-                await context.bot.send_message(
+                sent_msg = await context.bot.send_message(
                     chat_id=int(user_id),
                     text=body,
                     reply_markup=make_recall_keyboard(n_id),
                     parse_mode="Markdown",
+                    disable_notification=False
                 )
+                try:
+                    await context.bot.pin_chat_message(chat_id=int(user_id), message_id=sent_msg.message_id, disable_notification=False)
+                except Exception:
+                    pass
             else:
-                await send_lark_interactive_card(user_id, title, body, n_id)
+                await send_lark_interactive_card(user_id, title, body, n_id, header_color="orange")
         except Exception as e:
             logger.error(f"Lỗi gửi tin nhắc định kỳ ({platform}): {e}")
 
