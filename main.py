@@ -1,6 +1,7 @@
 """
 Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Push Notification Ưu Tiên Cao (Phương Án A)
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
+- Vòng lặp hẹn giờ độc lập chạy ngầm qua asyncio.create_task (khắc phục 100% lỗi không nhận nhắc)
 - Tích hợp Push Notification ưu tiên cao: Buộc rung & phát chuông, tự động Ghim tin nhắn (Pin) trên Telegram
 - Lark Suite kích hoạt Thẻ cảnh báo màu đỏ (Red Template) kèm rung chuông nổi bật
 - Hỗ trợ nhắc nhở theo khung giờ / ngày giờ tùy chọn (/nhac <id> <giờ> hoặc /save HH:MM ...)
@@ -1243,10 +1244,6 @@ async def send_lark_message(open_id: str, text: str):
 
 
 async def send_lark_interactive_card(open_id: str, title: str, content: str, note_id: int, header_color: str = "blue"):
-    """
-    Gửi thẻ tương tác Lark. 
-    header_color: 'red' (cảnh báo/ưu tiên cao), 'blue' (thông thường), 'orange' (nhắc nhở).
-    """
     token = await get_lark_tenant_token()
     if not token:
         return
@@ -1491,7 +1488,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
 
 # --- BỘ LẬP LỊCH TỰ ĐỘNG & PUSH NOTIFICATION ƯU TIÊN CAO (QUÉT MỖI PHÚT) ---
 
-async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
+async def dynamic_scheduler_job(bot_instance):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
     today_date = now.date()
@@ -1518,7 +1515,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             if platform == "telegram":
                 # Push Notification mức cao: Bật chuông/rung và tự động Ghim tin nhắn
-                sent_msg = await context.bot.send_message(
+                sent_msg = await bot_instance.send_message(
                     chat_id=int(user_id),
                     text=body,
                     reply_markup=make_recall_keyboard(n_id),
@@ -1526,7 +1523,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     disable_notification=False  # Buộc phát chuông và rung
                 )
                 try:
-                    await context.bot.pin_chat_message(
+                    await bot_instance.pin_chat_message(
                         chat_id=int(user_id),
                         message_id=sent_msg.message_id,
                         disable_notification=False
@@ -1556,7 +1553,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     for u in users:
                         p, uid = u["platform"], u["user_id"]
                         if p == "telegram":
-                            await context.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown", disable_notification=False)
+                            await bot_instance.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown", disable_notification=False)
                         else:
                             await send_lark_message(uid, msg)
         except Exception as e:
@@ -1596,7 +1593,7 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         n_id = selected_note["id"]
         try:
             if platform == "telegram":
-                sent_msg = await context.bot.send_message(
+                sent_msg = await bot_instance.send_message(
                     chat_id=int(user_id),
                     text=body,
                     reply_markup=make_recall_keyboard(n_id),
@@ -1604,13 +1601,25 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                     disable_notification=False
                 )
                 try:
-                    await context.bot.pin_chat_message(chat_id=int(user_id), message_id=sent_msg.message_id, disable_notification=False)
+                    await bot_instance.pin_chat_message(chat_id=int(user_id), message_id=sent_msg.message_id, disable_notification=False)
                 except Exception:
                     pass
             else:
                 await send_lark_interactive_card(user_id, title, body, n_id, header_color="orange")
         except Exception as e:
             logger.error(f"Lỗi gửi tin nhắc định kỳ ({platform}): {e}")
+
+
+async def scheduler_loop(application):
+    """Vòng lặp quét lịch hẹn độc lập qua asyncio, kích hoạt mỗi 60 giây."""
+    await asyncio.sleep(10)  # Đợi bot và kết nối database hoàn tất khởi động
+    logger.info("⏰ Vòng lặp hẹn giờ nhắc việc độc lập đã kích hoạt thành công!")
+    while True:
+        try:
+            await dynamic_scheduler_job(application.bot)
+        except Exception as e:
+            logger.error(f"Lỗi scheduler loop: {e}")
+        await asyncio.sleep(60)
 
 
 # --- WEB SERVER & APP LIFECYCLE ---
@@ -1689,9 +1698,8 @@ async def run_bot():
     application.add_handler(MessageHandler(filters.Document.ALL, telegram_handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_with_groq))
 
-    # Job Queue quét kiểm tra mỗi 60 giây
-    if application.job_queue:
-        application.job_queue.run_repeating(dynamic_scheduler_job, interval=60, first=10)
+    # Khởi chạy vòng lặp hẹn giờ độc lập chạy ngầm (thay thế JobQueue của Telegram)
+    asyncio.create_task(scheduler_loop(application))
 
     # Khởi chạy Web Server cho Lark
     await run_web_server()
