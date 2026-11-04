@@ -1,7 +1,8 @@
 """
-Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Nâng Cấp Tagging & AI Chấm Điểm Recall
+Trợ lý Ôn tập & Nhắc nhở Kiến thức Thông minh (Groq AI) - Bản Hẹn Giờ Tùy Chọn
 - Lưu trữ vĩnh viễn trên Supabase PostgreSQL (IPv4 Pooler)
-- Hỗ trợ gắn nhãn phân loại (#quytrinh, #vandon, #cod...) và lọc theo thẻ (/list #tag)
+- Hỗ trợ nhắc nhở theo khung giờ / ngày giờ tùy chọn (/nhac <id> <giờ> hoặc /save HH:MM ...)
+- Hỗ trợ gắn nhãn phân loại (#quytrinh, #vandon, #cod...) và lọc theo thẻ (/list #nhan)
 - Hỗ trợ Active Recall đối thoại: AI chấm điểm câu trả lời văn bản & voice trực tiếp
 - Đồng bộ chung dữ liệu thời gian thực giữa Telegram và Lark Suite
 - Tự động lưu file_id của tài liệu/ảnh và hỗ trợ lệnh /getfile để tải lại file gốc
@@ -18,7 +19,7 @@ import base64
 import asyncio
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import asyncpg
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -60,10 +61,57 @@ LARK_TOKEN_CACHE = {"token": "", "expires_at": 0.0}
 ACTIVE_RECALL_SESSIONS: Dict[str, int] = {}
 
 
+# --- HỖ TRỢ XỬ LÝ THỜI GIAN HẸN GIỜ ---
+
+def parse_custom_datetime(time_str: str) -> Optional[datetime]:
+    """
+    Phân tích chuỗi ngày giờ linh hoạt theo múi giờ Việt Nam (UTC+7):
+    - HH:MM (ví dụ 14:30, 08:00) -> Hôm nay hoặc ngày mai nếu giờ đã qua
+    - DD/MM HH:MM (ví dụ 05/11 15:30)
+    - DD/MM/YYYY HH:MM
+    """
+    now = datetime.now(LOCAL_TZ)
+    time_str = time_str.strip()
+
+    # Định dạng HH:MM
+    match_hm = re.match(r"^(\d{1,2}):(\d{2})$", time_str)
+    if match_hm:
+        h, m = int(match_hm.group(1)), int(match_hm.group(2))
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            target_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target_dt <= now:
+                target_dt += timedelta(days=1)
+            return target_dt
+
+    # Định dạng DD/MM HH:MM
+    match_dhm = re.match(r"^(\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2})$", time_str)
+    if match_dhm:
+        d, mon, h, m = int(match_dhm.group(1)), int(match_dhm.group(2)), int(match_dhm.group(3)), int(match_dhm.group(4))
+        try:
+            return datetime(now.year, mon, d, h, m, 0, tzinfo=LOCAL_TZ)
+        except ValueError:
+            return None
+
+    # Định dạng DD/MM/YYYY HH:MM
+    match_full = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})\s+(\d{1,2}):(\d{2})$", time_str)
+    if match_full:
+        d, mon, y, h, m = int(match_full.group(1)), int(match_full.group(2)), int(match_full.group(3)), int(match_full.group(4)), int(match_full.group(5))
+        try:
+            return datetime(y, mon, d, h, m, 0, tzinfo=LOCAL_TZ)
+        except ValueError:
+            return None
+
+    return None
+
+
+def extract_hashtags(text: str) -> List[str]:
+    tags = re.findall(r"#\w+", text)
+    return [t.lower() for t in set(tags)]
+
+
 # --- KẾT NỐI VÀ QUẢN LÝ DỮ LIỆU SUPABASE POSTGRESQL ---
 
 async def init_db():
-    """Khởi tạo connection pool tới Supabase PostgreSQL qua IPv4 Pooler."""
     global DB_POOL
     if not DATABASE_URL:
         logger.warning("⚠️ Chưa cấu hình biến DATABASE_URL!")
@@ -87,12 +135,6 @@ async def init_db():
         logger.error(f"❌ Lỗi khởi tạo kết nối Supabase: {e}")
 
 
-def extract_hashtags(text: str) -> List[str]:
-    """Tự động trích xuất các hashtag như #quytrinh, #vandon từ văn bản."""
-    tags = re.findall(r"#\w+", text)
-    return [t.lower() for t in set(tags)]
-
-
 async def db_save_note(
     platform: str,
     user_id: str,
@@ -102,9 +144,9 @@ async def db_save_note(
     target_date = None,
     file_id: Optional[str] = None,
     file_name: Optional[str] = None,
-    tags: Optional[List[str]] = None
+    tags: Optional[List[str]] = None,
+    remind_at: Optional[datetime] = None
 ) -> Optional[int]:
-    """Lưu bài học kèm thẻ nhãn và mã tệp gốc vào Supabase."""
     if not DB_POOL:
         logger.error("Database pool chưa sẵn sàng.")
         return None
@@ -112,11 +154,11 @@ async def db_save_note(
         async with DB_POOL.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags)
-                VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $9)
+                INSERT INTO user_notes (platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $9, $10)
                 RETURNING id;
                 """,
-                platform, str(user_id), content, cycle, cycle_label, target_date, file_id, file_name, tags or []
+                platform, str(user_id), content, cycle, cycle_label, target_date, file_id, file_name, tags or [], remind_at
             )
             return row["id"] if row else None
     except Exception as e:
@@ -125,14 +167,13 @@ async def db_save_note(
 
 
 async def db_get_note_by_id(note_id: int) -> Optional[dict]:
-    """Lấy chi tiết 1 bài học theo ID."""
     if not DB_POOL:
         return None
     try:
         async with DB_POOL.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                 FROM user_notes
                 WHERE id = $1;
                 """,
@@ -144,8 +185,20 @@ async def db_get_note_by_id(note_id: int) -> Optional[dict]:
         return None
 
 
+async def db_update_remind_time(note_id: int, remind_at: Optional[datetime]) -> bool:
+    """Cập nhật hoặc xóa mốc hẹn giờ tùy chọn của bài học."""
+    if not DB_POOL:
+        return False
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("UPDATE user_notes SET remind_at = $1 WHERE id = $2;", remind_at, note_id)
+            return True
+    except Exception as e:
+        logger.error(f"Lỗi cập nhật lịch hẹn #{note_id}: {e}")
+        return False
+
+
 async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_filter: Optional[str] = None) -> List[dict]:
-    """Lấy danh sách các bài học gần nhất (hỗ trợ lọc theo hashtag như #quytrinh)."""
     if not DB_POOL:
         return []
     try:
@@ -154,7 +207,7 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
                 clean_tag = tag_filter.lower()
                 rows = await conn.fetch(
                     """
-                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
+                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
                     WHERE $1 = ANY(tags) OR content ILIKE $2
                     ORDER BY id DESC
@@ -165,7 +218,7 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, created_at
+                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
                     ORDER BY id DESC
                     LIMIT $1;
@@ -179,14 +232,13 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
 
 
 async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int = 5) -> List[dict]:
-    """Tìm kiếm bài học theo từ khóa trong kho dữ liệu chung."""
     if not DB_POOL:
         return []
     try:
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, content, cycle_label, target_date, file_id, file_name, tags, created_at
+                SELECT id, content, cycle_label, target_date, file_id, file_name, tags, remind_at, created_at
                 FROM user_notes
                 WHERE content ILIKE $1
                 ORDER BY id DESC
@@ -201,7 +253,6 @@ async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int 
 
 
 async def db_update_progress(note_id: int, remembered: bool) -> str:
-    """Cập nhật bậc Spaced Repetition (1-3-7-14-30 ngày) trên Supabase."""
     if not DB_POOL:
         return "⚠️ Cơ sở dữ liệu chưa sẵn sàng."
 
@@ -251,14 +302,13 @@ async def db_update_progress(note_id: int, remembered: bool) -> str:
 
 
 async def db_get_due_notes(today_date) -> List[dict]:
-    """Lấy danh sách các bài học đến hạn ôn tập hôm nay."""
     if not DB_POOL:
         return []
     try:
         async with DB_POOL.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at
                 FROM user_notes
                 WHERE cycle = 'hangngay' OR target_date <= $1
                 ORDER BY id DESC;
@@ -271,16 +321,33 @@ async def db_get_due_notes(today_date) -> List[dict]:
         return []
 
 
+async def db_get_custom_remind_notes(now_dt: datetime) -> List[dict]:
+    """Lấy các bài học có lịch hẹn giờ tùy chọn đã đến hạn nhắc."""
+    if not DB_POOL:
+        return []
+    try:
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at
+                FROM user_notes
+                WHERE remind_at IS NOT NULL AND remind_at <= $1
+                ORDER BY remind_at ASC;
+                """,
+                now_dt
+            )
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Lỗi lấy custom remind notes: {e}")
+        return []
+
+
 async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bool:
-    """Xóa đúng 1 bài học theo ID từ bất kỳ nền tảng nào."""
     if not DB_POOL:
         return False
     try:
         async with DB_POOL.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM user_notes WHERE id = $1;",
-                note_id
-            )
+            result = await conn.execute("DELETE FROM user_notes WHERE id = $1;", note_id)
             return result.endswith("1")
     except Exception as e:
         logger.error(f"Lỗi xóa bài #{note_id}: {e}")
@@ -288,7 +355,6 @@ async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bo
 
 
 async def db_delete_user_data(platform: str, user_id: str) -> bool:
-    """Xóa toàn bộ kho bài học và tệp khi cần làm sạch."""
     if not DB_POOL:
         return False
     try:
@@ -303,7 +369,6 @@ async def db_delete_user_data(platform: str, user_id: str) -> bool:
 # --- KẾT NỐI GROQ AI ---
 
 async def ask_ai(prompt: str) -> str:
-    """Truy vấn Groq AI cho văn bản thông thường qua ClientSession toàn cục."""
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -347,7 +412,6 @@ async def ask_ai(prompt: str) -> str:
 
 
 async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
-    """Truy vấn Groq AI Vision/OCR với các model đang hỗ trợ."""
     if not GROQ_API_KEY:
         return "⚠️ Chưa cấu hình GROQ_API_KEY."
 
@@ -401,7 +465,6 @@ async def ask_ai_vision(image_bytes: bytes, prompt: str, mime_type: str = "image
 
 
 async def ask_ai_transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
-    """Chuyển đổi âm thanh giọng nói (voice) thành văn bản qua Groq Whisper."""
     if not GROQ_API_KEY:
         return ""
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -425,7 +488,6 @@ async def ask_ai_transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg
 
 
 async def evaluate_active_recall_answer(note_content: str, user_answer: str) -> (str, int):
-    """AI so sánh câu trả lời của người dùng với nội dung bài học gốc, chấm điểm và nhận xét."""
     prompt = (
         f"Bạn là người kiểm tra kiến thức công tâm và tận tâm.\n\n"
         f"--- NỘI DUNG BÀI HỌC GỐC ---\n{note_content}\n"
@@ -507,22 +569,26 @@ async def process_document_content(file_name: str, text_content: str) -> str:
 
 HELP_MESSAGE = (
     "📖 **HỆ THỐNG LỆNH TRỢ LÝ HỌC TẬP (SUPABASE CLOUD)**\n\n"
-    "📝 **1. LƯU BÀI HỌC VÀ GẮN NHÃN (TAGS):**\n"
-    "• `/save #quytrinh #vandon <nội dung>`: Lưu bài và gắn nhãn theo chủ đề\n"
-    "• `/save 3ngay #cod <nội dung>`: Tự do chọn thời gian ôn tập và gắn thẻ\n"
+    "⏰ **1. HẸN GIỜ NHẮC TÙY CHỌN (MỚI):**\n"
+    "• `/save 14:30 #vandon Kiểm tra gói hàng`: Đặt nhắc chính xác lúc 14:30 hôm nay\n"
+    "• `/save 05/11 09:00 #quytrinh Họp bưu cục`: Đặt nhắc ngày và giờ cụ thể\n"
+    "• `/nhac <id> <thời gian>`: Đặt giờ nhắc cho bài đã có (Ví dụ: `/nhac 8 16:00` hoặc `/nhac 8 05/11 08:30`)\n\n"
+    "📝 **2. LƯU BÀI HỌC VÀ GẮN NHÃN (TAGS):**\n"
+    "• `/save #quytrinh #vandon <nội dung>`: Lưu bài theo lộ trình Spaced Repetition\n"
+    "• `/save 3ngay #cod <nội dung>`: Lưu bài ôn sau 3 ngày\n"
     "• `/save hangngay <nội dung>`: Nhắc đều đặn mỗi ngày\n\n"
-    "🧠 **2. ÔN TẬP & AI CHẤM ĐIỂM RECALL:**\n"
-    "• `/ontap` hoặc `/ontap <id>`: Tạo câu hỏi ôn tập\n"
-    "• Bấm nút **'✍️ Trả lời câu hỏi'** rồi gửi văn bản hoặc tin nhắn thoại (voice): AI sẽ tự chấm điểm và đánh giá ý đúng/thiếu!\n\n"
-    "📎 **3. ĐỌC TÀI LIỆU & TẢI LẠI FILE GỐC:**\n"
+    "🧠 **3. ÔN TẬP & AI CHẤM ĐIỂM RECALL:**\n"
+    "• `/ontap` hoặc `/ontap <id>`: Tạo câu hỏi ôn tập tức thì\n"
+    "• Bấm nút **'✍️ Trả lời câu hỏi'** rồi gửi văn bản hoặc tin nhắn thoại (voice) để AI chấm điểm\n\n"
+    "📎 **4. ĐỌC TÀI LIỆU & TẢI LẠI FILE GỐC:**\n"
     "• Gửi file **Word (.docx)**, **Excel (.xlsx)** hoặc **PDF (.pdf)** để bot tự tóm tắt\n"
-    "• Gửi **Ảnh chụp tài liệu** để OCR và tạo câu hỏi tự kiểm tra\n"
-    "• `/getfile <id>`: Yêu cầu bot gửi trả lại file gốc đính kèm của bài học\n\n"
-    "🔍 **4. TRA CỨU THEO CHUYÊN MỤC:**\n"
-    "• `/list`: Xem tất cả bài học đã lưu\n"
-    "• `/list #quytrinh`: Lọc riêng các bài thuộc chuyên mục quy trình\n"
+    "• Gửi **Ảnh chụp tài liệu** để OCR\n"
+    "• `/getfile <id>`: Tải lại file gốc đính kèm\n\n"
+    "🔍 **5. TRA CỨU THEO CHUYÊN MỤC:**\n"
+    "• `/list`: Xem tất cả bài học\n"
+    "• `/list #quytrinh`: Lọc riêng bài học theo hashtag\n"
     "• `/search <từ khóa>`: Tìm kiếm theo từ khóa\n\n"
-    "🗑️ **5. QUẢN LÝ DỮ LIỆU:**\n"
+    "🗑️ **6. QUẢN LÝ DỮ LIỆU:**\n"
     "• `/xoa <id>`: Xóa chọn lọc 1 bài học theo mã ID\n"
     "• `/xoatatca`: Xóa sạch toàn bộ bộ nhớ có xác nhận an toàn"
 )
@@ -533,55 +599,124 @@ HELP_MESSAGE = (
 async def handle_save_command_core(platform: str, user_id: str, args_text: str) -> str:
     args = args_text.strip().split()
     if not args:
-        return "⚠️ Cú pháp: `/save [chu_kỳ] [#nhãn] <nội dung>`\nVí dụ: `/save 3ngay #quytrinh #vandon Kiểm tra gói hàng bưu cục`"
+        return (
+            "⚠️ Cú pháp:\n"
+            "• Hẹn giờ: `/save 14:30 [#nhãn] <nội dung>` hoặc `/save 05/11 08:30 <nội dung>`\n"
+            "• Chu kỳ: `/save [chu_kỳ] [#nhãn] <nội dung>`\n"
+            "Ví dụ: `/save 15:30 #vandon Đối soát tiền COD bưu cục`"
+        )
 
     now = datetime.now(LOCAL_TZ)
     today_date = now.date()
 
-    first_arg = args[0].lower().replace("-", "").replace("_", "")
-    mode_map = {
-        "hangngay": ("hangngay", 0, "Hằng ngày"),
-        "trongngay": ("trongngay", 0, "Hôm nay"),
-        "1ngay": ("spaced", 0, "Sau 1 ngày"),
-        "homsau": ("spaced", 0, "Sau 1 ngày"),
-        "2ngay": ("custom", 2, "Sau 2 ngày"),
-        "3ngay": ("custom", 3, "Sau 3 ngày"),
-        "7ngay": ("custom", 7, "Sau 7 ngày"),
-    }
+    remind_at = None
+    cycle_type = "spaced"
+    cycle_label = "Lộ trình ghi nhớ bền vững (1-3-7-14-30 ngày)"
+    target_date = today_date + timedelta(days=SPACED_INTERVALS[0])
+    raw_content = ""
 
-    if first_arg in mode_map:
-        cycle_type, offset_days, cycle_label = mode_map[first_arg]
-        raw_content = " ".join(args[1:]).strip()
-    else:
-        cycle_type, offset_days, cycle_label = ("spaced", 0, "Lộ trình ghi nhớ bền vững (1-3-7-14-30 ngày)")
-        raw_content = " ".join(args).strip()
+    # 1. Thử nhận diện hẹn ngày giờ: DD/MM HH:MM (2 tham số đầu)
+    if len(args) >= 3 and re.match(r"^\d{1,2}[/-]\d{1,2}$", args[0]) and re.match(r"^\d{1,2}:\d{2}$", args[1]):
+        parsed_dt = parse_custom_datetime(f"{args[0]} {args[1]}")
+        if parsed_dt:
+            remind_at = parsed_dt
+            cycle_type = "custom_time"
+            cycle_label = f"Hẹn giờ: {remind_at.strftime('%H:%M ngày %d/%m/%Y')}"
+            target_date = remind_at.date()
+            raw_content = " ".join(args[2:]).strip()
+
+    # 2. Thử nhận diện hẹn giờ trong ngày: HH:MM (tham số đầu)
+    if not remind_at and re.match(r"^\d{1,2}:\d{2}$", args[0]):
+        parsed_dt = parse_custom_datetime(args[0])
+        if parsed_dt:
+            remind_at = parsed_dt
+            cycle_type = "custom_time"
+            cycle_label = f"Hẹn giờ: {remind_at.strftime('%H:%M ngày %d/%m/%Y')}"
+            target_date = remind_at.date()
+            raw_content = " ".join(args[1:]).strip()
+
+    # 3. Nếu không phải hẹn giờ, kiểm tra chu kỳ truyền thống
+    if not remind_at:
+        first_arg = args[0].lower().replace("-", "").replace("_", "")
+        mode_map = {
+            "hangngay": ("hangngay", 0, "Hằng ngày"),
+            "trongngay": ("trongngay", 0, "Hôm nay"),
+            "1ngay": ("spaced", 0, "Sau 1 ngày"),
+            "homsau": ("spaced", 0, "Sau 1 ngày"),
+            "2ngay": ("custom", 2, "Sau 2 ngày"),
+            "3ngay": ("custom", 3, "Sau 3 ngày"),
+            "7ngay": ("custom", 7, "Sau 7 ngày"),
+        }
+        if first_arg in mode_map:
+            cycle_type, offset_days, cycle_label = mode_map[first_arg]
+            raw_content = " ".join(args[1:]).strip()
+            if cycle_type == "spaced":
+                target_date = today_date + timedelta(days=SPACED_INTERVALS[0])
+            elif cycle_type == "custom":
+                target_date = today_date + timedelta(days=offset_days)
+            else:
+                target_date = today_date
+        else:
+            raw_content = " ".join(args).strip()
 
     if not raw_content:
         return "⚠️ Bạn chưa nhập nội dung kiến thức cần ghi nhớ!"
 
-    # Tự động trích xuất các hashtag
     tags = extract_hashtags(raw_content)
 
-    if cycle_type == "spaced":
-        target_date = today_date + timedelta(days=SPACED_INTERVALS[0])
-    elif cycle_type == "custom":
-        target_date = today_date + timedelta(days=offset_days)
-    else:
-        target_date = today_date
-
-    note_id = await db_save_note(platform, user_id, raw_content, cycle_type, cycle_label, target_date, tags=tags)
+    note_id = await db_save_note(
+        platform, user_id, raw_content, cycle_type, cycle_label, target_date,
+        tags=tags, remind_at=remind_at
+    )
     if not note_id:
         return "❌ Lỗi lưu dữ liệu vào Supabase! Hãy kiểm tra lại kết nối database."
 
     tags_display = f"\n🏷️ *Nhãn chuyên mục:* `{' '.join(tags)}`" if tags else ""
+    remind_display = f"\n⏰ *Thời gian hẹn nhắc:* `{remind_at.strftime('%H:%M ngày %d/%m/%Y')}`" if remind_at else f"\n📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`"
 
     return (
-        f"✅ **Đã lưu kiến thức bền vững [Mã #{note_id}]!** ☁️\n\n"
+        f"✅ **Đã lưu kiến thức [Mã #{note_id}]!** ☁️\n\n"
         f"📝 *Nội dung:* {raw_content}\n"
-        f"⏰ *Chế độ:* **{cycle_label}**{tags_display}\n"
-        f"📅 *Lần ôn tiếp theo:* `{target_date.strftime('%d/%m/%Y')}`\n\n"
-        f"💡 Ôn ngay: `/ontap {note_id}`"
+        f"⚙️ *Chế độ:* **{cycle_label}**"
+        f"{tags_display}"
+        f"{remind_display}\n\n"
+        f"💡 Ôn ngay: `/ontap {note_id}` | Hẹn giờ lại: `/nhac {note_id} <giờ>`"
     )
+
+
+async def handle_nhac_command_core(platform: str, user_id: str, args_text: str) -> str:
+    """Xử lý lệnh đặt hẹn giờ cho bài học cũ: /nhac <id> <thời gian>"""
+    args = args_text.strip().split()
+    if len(args) < 2:
+        return (
+            "⚠️ Cú pháp đặt lịch hẹn nhắc bài học:\n"
+            "• `/nhac <id> <HH:MM>` (Ví dụ: `/nhac 8 15:30` - nhắc lúc 15:30 hôm nay)\n"
+            "• `/nhac <id> <DD/MM HH:MM>` (Ví dụ: `/nhac 8 05/11 09:00`)"
+        )
+
+    try:
+        note_id = int(args[0])
+    except ValueError:
+        return "⚠️ Mã bài học phải là số. Ví dụ: `/nhac 8 15:30`"
+
+    note = await db_get_note_by_id(note_id)
+    if not note:
+        return f"❌ Không tìm thấy bài học #{note_id}."
+
+    time_input = " ".join(args[1:])
+    parsed_dt = parse_custom_datetime(time_input)
+    if not parsed_dt:
+        return f"⚠️ Định dạng thời gian '{time_input}' không hợp lệ. Vui lòng nhập dạng `15:30` hoặc `05/11 09:00`."
+
+    success = await db_update_remind_time(note_id, parsed_dt)
+    if success:
+        return (
+            f"⏰ **Đã lên lịch hẹn nhắc bài [#{note_id}] thành công!**\n\n"
+            f"📖 *Nội dung:* {note['content'][:120]}...\n"
+            f"🔔 *Thời điểm nhắc:* `{parsed_dt.strftime('%H:%M ngày %d/%m/%Y')}`\n\n"
+            f"Bot sẽ tự động gửi câu hỏi Active Recall cho bạn vào đúng khung giờ này! 🎯"
+        )
+    return "❌ Lỗi khi cập nhật lịch hẹn lên cơ sở dữ liệu."
 
 
 async def handle_ontap_command_core(platform: str, user_id: str, arg_id: str) -> (str, Optional[int]):
@@ -609,9 +744,10 @@ async def handle_ontap_command_core(platform: str, user_id: str, arg_id: str) ->
     created_str = target_note["created_at"].strftime("%d/%m/%Y") if target_note.get("created_at") else ""
     file_info = f"\n📎 *Tệp đính kèm:* `{target_note['file_name']}` (Tải lại: `/getfile {target_note['id']}`)" if target_note.get("file_id") else ""
     tags_str = f"\n🏷️ *Nhãn:* `{' '.join(target_note.get('tags', []))}`" if target_note.get("tags") else ""
+    remind_str = f"\n⏰ *Lịch hẹn nhắc:* `{target_note['remind_at'].astimezone(LOCAL_TZ).strftime('%H:%M %d/%m')}`" if target_note.get("remind_at") else ""
 
     reply = (
-        f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**{tags_str}{file_info}\n\n"
+        f"📚 **Ôn tập bài [#{target_note['id']}] (Ngày lưu: {created_str}):**{tags_str}{remind_str}{file_info}\n\n"
         f"{ai_question}"
     )
     return reply, target_note["id"]
@@ -630,7 +766,8 @@ async def handle_list_notes_core(platform: str, user_id: str, tag_filter: Option
         t_date_str = t_date.strftime("%d/%m/%Y") if t_date else "Đã thuộc bền vững"
         file_tag = f" 📎 `[{item.get('file_name')}]`" if item.get("file_id") else ""
         tags_tag = f" 🏷️`{' '.join(item.get('tags', []))}`" if item.get("tags") else ""
-        reply += f"🔹 **[#{n_id}]**{tags_tag}{file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
+        remind_tag = f" ⏰`{item['remind_at'].astimezone(LOCAL_TZ).strftime('%H:%M %d/%m')}`" if item.get("remind_at") else ""
+        reply += f"🔹 **[#{n_id}]**{tags_tag}{remind_tag}{file_tag} (Kế hoạch: `{t_date_str}`)\n👉 {item['content'][:100]}...\n\n"
     return reply
 
 
@@ -648,7 +785,8 @@ async def handle_search_notes_core(platform: str, user_id: str, keyword: str) ->
         created_str = item["created_at"].strftime("%d/%m/%Y") if item.get("created_at") else ""
         file_hint = f" (File: `/getfile {item['id']}`)" if item.get("file_id") else ""
         tags_str = f" 🏷️`{' '.join(item.get('tags', []))}`" if item.get("tags") else ""
-        reply += f"📌 **[#{item['id']}]** `({created_str})`{tags_str}{file_hint}:\n{item['content']}\n\n"
+        remind_str = f" ⏰`{item['remind_at'].astimezone(LOCAL_TZ).strftime('%H:%M %d/%m')}`" if item.get("remind_at") else ""
+        reply += f"📌 **[#{item['id']}]** `({created_str})`{tags_str}{remind_str}{file_hint}:\n{item['content']}\n\n"
     return reply
 
 
@@ -674,8 +812,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"Chào {user_name}! 🌟✨ Chúc bạn tràn đầy năng lượng và ngập tràn cảm hứng học tập! 🚀🔥\n\n"
         f"Tôi là **Trợ lý Ôn tập & Đồng hành Tri thức (Cloud Edition)**. Hệ thống đã nâng cấp:\n"
+        f"⏰ **Hẹn giờ tùy chọn**: `/save 14:30 <nội dung>` hoặc `/nhac <id> 15:00`\n"
         f"🏷️ **Hashtag phân loại**: Lưu kèm `#quytrinh`, `#vandon` và lọc qua `/list #nhãn`\n"
-        f"🧠 **AI Chấm Điểm Recall**: Gửi tin nhắn văn bản hoặc giọng nói (voice) để AI đánh giá mức độ hiểu sâu!"
+        f"🧠 **AI Chấm Điểm Recall**: Gửi văn bản hoặc tin nhắn thoại (voice) để AI đánh giá mức độ hiểu sâu!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
@@ -689,6 +828,13 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     args_text = " ".join(context.args) if context.args else ""
     res = await handle_save_command_core("telegram", chat_id, args_text)
+    await update.message.reply_text(res, parse_mode="Markdown")
+
+
+async def nhac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    args_text = " ".join(context.args) if context.args else ""
+    res = await handle_nhac_command_core("telegram", chat_id, args_text)
     await update.message.reply_text(res, parse_mode="Markdown")
 
 
@@ -717,7 +863,6 @@ async def search_notes_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gửi trả lại file gốc theo mã ID bài học."""
     if not context.args:
         await update.message.reply_text("⚠️ Vui lòng nhập mã bài học cần lấy file. Ví dụ: `/getfile 3`", parse_mode="Markdown")
         return
@@ -751,7 +896,6 @@ async def getfile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh xóa chọn lọc: /xoa <id>"""
     chat_id = str(update.effective_chat.id)
     if not context.args:
         await update.message.reply_text("⚠️ Vui lòng nhập mã bài học cần xóa. Ví dụ: `/xoa 3`", parse_mode="Markdown")
@@ -771,7 +915,6 @@ async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh xóa sạch dữ liệu có xác nhận an toàn."""
     chat_id = str(update.effective_chat.id)
     arg = context.args[0].lower().strip() if context.args else ""
 
@@ -830,7 +973,6 @@ async def telegram_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý tin nhắn âm thanh Voice trả lời Active Recall qua Groq Whisper."""
     chat_id = str(update.effective_chat.id)
     voice = update.message.voice
     if not voice:
@@ -850,7 +992,6 @@ async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TY
 
         await status_msg.edit_text(f"🗣️ *Bạn đã nói:* \"{transcribed_text}\"\n\n🤖 Đang đối chiếu bài học và chấm điểm...", parse_mode="Markdown")
 
-        # Kiểm tra xem có đang trong phiên trả lời ôn tập không
         if chat_id in ACTIVE_RECALL_SESSIONS:
             target_id = ACTIVE_RECALL_SESSIONS.pop(chat_id)
             note = await db_get_note_by_id(target_id)
@@ -869,7 +1010,6 @@ async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text(reply_text)
                 return
 
-        # Nếu không trong phiên ôn tập, chuyển sang xử lý AI đối thoại bình thường
         recent_notes = await db_get_user_notes("telegram", chat_id, limit=10)
         context_data = ""
         if recent_notes:
@@ -884,13 +1024,12 @@ async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý trò chuyện hoặc tiếp nhận câu trả lời Active Recall dạng văn bản."""
     user_text = update.message.text.strip()
     chat_id = str(update.effective_chat.id)
     raw_name = update.effective_user.first_name or "Phong"
     call_name = "Phong" if "phong" in raw_name.lower() or raw_name in ["Bạn", "User"] else raw_name
 
-    # 1. Ưu tiên xử lý nếu đang trong phiên chờ trả lời Active Recall
+    # 1. Tiếp nhận câu trả lời Active Recall dạng văn bản
     if chat_id in ACTIVE_RECALL_SESSIONS:
         target_id = ACTIVE_RECALL_SESSIONS.pop(chat_id)
         note = await db_get_note_by_id(target_id)
@@ -929,7 +1068,8 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
             c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
             f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
             t_note = f" [Thẻ: {' '.join(n.get('tags', []))}]" if n.get("tags") else ""
-            context_data += f"- [Mã #{n['id']}]{t_note} (Ngày {c_date}){f_note}: {n['content']}\n"
+            r_note = f" [Hẹn: {n['remind_at'].astimezone(LOCAL_TZ).strftime('%H:%M %d/%m')}]" if n.get("remind_at") else ""
+            context_data += f"- [Mã #{n['id']}]{t_note}{r_note} (Ngày {c_date}){f_note}: {n['content']}\n"
     else:
         context_data = "Người dùng hiện chưa lưu bài học nào trong cơ sở dữ liệu.\n"
 
@@ -941,7 +1081,7 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
         f"--- KẾT THÚC DỮ LIỆU ĐÃ LƯU ---\n\n"
         f"YÊU CẦU ĐỐI THOẠI & TRÍCH XUẤT:\n"
         f"1. Nếu {call_name} hỏi, tìm kiếm, tóm tắt hoặc nhắc lại những bài học/quy trình đã từng lưu: hãy trích xuất chính xác từ dữ liệu trên, nêu rõ mã bài học (#ID) và giải đáp chi tiết, mạch lạc.\n"
-        f"2. Nếu bài học có tệp gốc, hãy nhắc {call_name} có thể gõ /getfile <id> để tải lại tệp bất kỳ lúc nào.\n"
+        f"2. Nếu {call_name} muốn đặt giờ nhắc (ví dụ 'nhắc tôi bài 8 lúc 3h chiều'), hãy hướng dẫn cú pháp nhanh: /nhac <id> <giờ>.\n"
         f"3. Xưng hô gần gũi, gọi tên '{call_name}', dùng emoji tích cực (🌟, 🚀, 💡).\n"
         f"4. Trả lời bằng tiếng Việt tự nhiên, súc tích.\n\n"
         f"Tin nhắn của {call_name}: '{user_text}'"
@@ -1255,7 +1395,6 @@ async def dispatch_lark_event(open_id: str, message: dict):
     if not raw:
         return
 
-    # Kiểm tra phiên chờ trả lời Active Recall trên Lark
     if open_id in ACTIVE_RECALL_SESSIONS:
         target_id = ACTIVE_RECALL_SESSIONS.pop(open_id)
         note = await db_get_note_by_id(target_id)
@@ -1280,6 +1419,9 @@ async def dispatch_lark_event(open_id: str, message: dict):
         await send_lark_message(open_id, HELP_MESSAGE)
     elif raw.startswith("/save"):
         reply = await handle_save_command_core("lark", open_id, raw[5:].strip())
+        await send_lark_message(open_id, reply)
+    elif raw.startswith("/nhac"):
+        reply = await handle_nhac_command_core("lark", open_id, raw[5:].strip())
         await send_lark_message(open_id, reply)
     elif raw.startswith("/list"):
         parts = raw.split()
@@ -1323,7 +1465,8 @@ async def dispatch_lark_event(open_id: str, message: dict):
                 c_date = n["created_at"].strftime("%d/%m/%Y") if n.get("created_at") else "Gần đây"
                 f_note = f" (Có tệp gốc: {n['file_name']})" if n.get("file_id") else ""
                 t_note = f" [Thẻ: {' '.join(n.get('tags', []))}]" if n.get("tags") else ""
-                context_data += f"- [Mã #{n['id']}]{t_note} (Ngày {c_date}){f_note}: {n['content']}\n"
+                r_note = f" [Hẹn: {n['remind_at'].astimezone(LOCAL_TZ).strftime('%H:%M %d/%m')}]" if n.get("remind_at") else ""
+                context_data += f"- [Mã #{n['id']}]{t_note}{r_note} (Ngày {c_date}){f_note}: {n['content']}\n"
         else:
             context_data = "Chưa có bài học nào được lưu.\n"
 
@@ -1331,27 +1474,57 @@ async def dispatch_lark_event(open_id: str, message: dict):
             f"Bạn là người bạn trợ lý học tập thân thiết của anh Phong.\n"
             f"Dưới đây là các bài học Phong đã lưu:\n{context_data}\n\n"
             f"Hãy giải đáp tin nhắn của Phong, nếu liên quan bài học cũ hãy trích xuất chính xác kèm mã bài học (#ID). "
+            f"Nếu Phong muốn đặt giờ nhắc, hướng dẫn dùng lệnh /nhac <id> <giờ>. "
             f"Xưng hô tự nhiên, gọi tên Phong, dùng emoji vui vẻ (🌟, 🚀, 💡): '{raw}'"
         )
         reply = await ask_ai(prompt)
         await send_lark_message(open_id, reply)
 
 
-# --- BỘ LẬP LỊCH TỰ ĐỘNG ---
+# --- BỘ LẬP LỊCH TỰ ĐỘNG (QUÉT MỖI PHÚT) ---
 
 async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
     today_date = now.date()
 
-    is_morning = (current_time_str == "10:00")
-    is_evening = (current_time_str == "19:30")
-    is_night = (current_time_str == "22:00")
+    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at)
+    custom_due = await db_get_custom_remind_notes(now)
+    for note in custom_due:
+        n_id = note["id"]
+        platform = note["platform"]
+        user_id = note["user_id"]
+        
+        prompt = (
+            f"Bài học: '{note['content']}'.\n"
+            "Hãy tạo 1 câu hỏi ôn tập Active Recall ngắn gọn bằng tiếng Việt để kiểm tra phản xạ ngay lúc này."
+        )
+        ai_q = await ask_ai(prompt)
+        title = "⏰ **Thông Báo Nhắc Nhở Hẹn Giờ!** 🔔✨"
+        body = (
+            f"{title}\n\n"
+            f"📖 *Nội dung bài #{n_id}:* {note['content']}\n\n"
+            f"{ai_q}"
+        )
 
-    if not (is_morning or is_evening or is_night):
-        return
+        try:
+            if platform == "telegram":
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=body,
+                    reply_markup=make_recall_keyboard(n_id),
+                    parse_mode="Markdown"
+                )
+            else:
+                await send_lark_interactive_card(user_id, title, body, n_id)
+            
+            # Sau khi nhắc xong, hủy mốc hẹn giờ để không nhắc lặp lại
+            await db_update_remind_time(n_id, None)
+        except Exception as e:
+            logger.error(f"Lỗi gửi thông báo hẹn giờ bài #{n_id}: {e}")
 
-    if is_night:
+    # 2. Khung giờ nhắc tổng kết đêm 22:00
+    if current_time_str == "22:00":
         msg = (
             "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
             "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
@@ -1369,6 +1542,12 @@ async def dynamic_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                             await send_lark_message(uid, msg)
         except Exception as e:
             logger.error(f"Lỗi gửi nhắc đêm: {e}")
+        return
+
+    # 3. Khung giờ nhắc Spaced Repetition cố định: 10:00 sáng & 19:30 tối
+    is_morning = (current_time_str == "10:00")
+    is_evening = (current_time_str == "19:30")
+    if not (is_morning or is_evening):
         return
 
     due_notes = await db_get_due_notes(today_date)
@@ -1432,7 +1611,8 @@ async def run_web_server():
 async def setup_bot_commands(application):
     commands = [
         BotCommand("help", "Bảng hướng dẫn lệnh mẫu"),
-        BotCommand("save", "Lưu bài học kèm nhãn (#nhan)"),
+        BotCommand("save", "Lưu bài học (/save 14:30 #tag ...)"),
+        BotCommand("nhac", "Đặt giờ nhắc cho bài học (/nhac <id> <giờ>)"),
         BotCommand("ontap", "Ôn tập kiến thức & AI chấm điểm"),
         BotCommand("list", "Xem danh sách hoặc lọc nhãn (/list #nhan)"),
         BotCommand("search", "Tìm bài học cũ theo từ khóa"),
@@ -1468,6 +1648,7 @@ async def run_bot():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("lenh", help_command))
     application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("nhac", nhac_command))
     application.add_handler(CommandHandler("ontap", ontap_command))
     application.add_handler(CommandHandler("list", list_notes_command))
     application.add_handler(CommandHandler("search", search_notes_command))
@@ -1478,13 +1659,13 @@ async def run_bot():
     application.add_handler(CommandHandler("xoahet", xoatatca_command))
     application.add_handler(CallbackQueryHandler(telegram_callback_handler))
 
-    # Đăng ký nhận file, hình ảnh, âm thanh voice và text
+    # Đăng ký nhận voice, ảnh, file, text
     application.add_handler(MessageHandler(filters.VOICE, handle_telegram_voice))
     application.add_handler(MessageHandler(filters.PHOTO, telegram_handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, telegram_handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_with_groq))
 
-    # Job Queue nhắc nhở mỗi 60 giây
+    # Job Queue quét kiểm tra mỗi 60 giây
     if application.job_queue:
         application.job_queue.run_repeating(dynamic_scheduler_job, interval=60, first=10)
 
