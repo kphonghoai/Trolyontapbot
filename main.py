@@ -882,11 +882,10 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     arg_id = context.args[0] if context.args else ""
     res, note_id = await handle_ontap_command_core("telegram", chat_id, arg_id)
-    if note_id:
+if note_id:
        await safe_reply_markdown(update.message, res, reply_markup=make_recall_keyboard(note_id))
     else:
         await safe_reply_markdown(update.message, res)
-
 
 async def list_notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -1705,6 +1704,17 @@ async def setup_bot_commands(application):
     except Exception as e:
         logger.error(f"Lỗi cài đặt Telegram Bot commands: {e}")
 
+async def keep_alive_ping(app_url: str):
+    """Tự ping định kỳ để Render không bị spin down (ngủ đông)."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if GLOBAL_SESSION and not GLOBAL_SESSION.closed and app_url:
+                async with GLOBAL_SESSION.get(app_url, timeout=10) as resp:
+                    logger.info(f"Self-ping keep-alive: status {resp.status}")
+        except Exception as e:
+            logger.warning(f"Self-ping failed: {e}")
+        await asyncio.sleep(600)  # Ping mỗi 10 phút
 
 async def run_bot():
     global GLOBAL_SESSION
@@ -1767,17 +1777,6 @@ async def run_bot():
         if DB_POOL:
             await DB_POOL.close()
 
-async def keep_alive_ping(app_url: str):
-    """Tự ping định kỳ để Render không bị spin down (ngủ đông)."""
-    await asyncio.sleep(60)
-    while True:
-        try:
-            if GLOBAL_SESSION and not GLOBAL_SESSION.closed and app_url:
-                async with GLOBAL_SESSION.get(app_url, timeout=10) as resp:
-                    logger.info(f"Self-ping keep-alive: status {resp.status}")
-        except Exception as e:
-            logger.warning(f"Self-ping failed: {e}")
-        await asyncio.sleep(600)  # Ping mỗi 10 phút
 def main():
     try:
         asyncio.run(run_bot())
