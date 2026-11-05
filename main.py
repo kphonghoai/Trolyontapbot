@@ -64,6 +64,9 @@ LARK_TOKEN_CACHE = {"token": "", "expires_at": 0.0}
 # Lưu trạng thái người dùng đang chờ trả lời câu hỏi Active Recall {user_id: note_id}
 ACTIVE_RECALL_SESSIONS: Dict[str, int] = {}
 
+# Bộ đệm lưu các mốc giờ đã bắn thông báo trong ngày (ngăn chặn bắn lặp trong cùng 1 phút)
+TRIGGERED_TIME_SLOTS = set()
+
 
 # --- HỖ TRỢ XỬ LÝ THỜI GIAN HẸN GIỜ ---
 
@@ -229,28 +232,45 @@ async def db_get_user_notes(platform: str, user_id: str, limit: int = 15, tag_fi
                 clean_tag = tag_filter.lower()
                 rows = await conn.fetch(
                     """
-                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
+                    SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
-                    WHERE ($1 = ANY(tags) OR content ILIKE $2)
+                    WHERE platform = $1 AND user_id = $2 AND ($3 = ANY(tags) OR content ILIKE $4)
                     ORDER BY id DESC
-                    LIMIT $3;
+                    LIMIT $5;
                     """,
-                    clean_tag, f"%{clean_tag}%", limit
+                    platform, str(user_id), clean_tag, f"%{clean_tag}%", limit
                 )
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT id, platform, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
+                    SELECT id, platform, user_id, content, cycle, cycle_label, target_date, stage, file_id, file_name, tags, remind_at, created_at
                     FROM user_notes
+                    WHERE platform = $1 AND user_id = $2
                     ORDER BY id DESC
-                    LIMIT $1;
+                    LIMIT $3;
                     """,
-                    limit
+                    platform, str(user_id), limit
                 )
             return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Lỗi lấy danh sách ghi chú: {e}")
         return []
+
+
+async def db_delete_user_data(platform: str, user_id: str) -> bool:
+    """Chỉ xóa các ghi chú thuộc về đúng tài khoản yêu cầu, không xóa sạch bảng."""
+    if not DB_POOL:
+        return False
+    try:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM user_notes WHERE platform = $1 AND user_id = $2;",
+                platform, str(user_id)
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Lỗi làm sạch dữ liệu người dùng {user_id}: {e}")
+        return False
 
 
 async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int = 5) -> List[dict]:
@@ -262,11 +282,11 @@ async def db_search_notes(platform: str, user_id: str, keyword: str, limit: int 
                 """
                 SELECT id, content, cycle_label, target_date, file_id, file_name, tags, remind_at, created_at
                 FROM user_notes
-                WHERE content ILIKE $1
+                WHERE platform = $1 AND user_id = $2 AND content ILIKE $3
                 ORDER BY id DESC
-                LIMIT $2;
+                LIMIT $4;
                 """,
-                f"%{keyword}%", limit
+                platform, str(user_id), f"%{keyword}%", limit
             )
             return [dict(r) for r in rows]
     except Exception as e:
@@ -369,22 +389,13 @@ async def db_delete_single_note(platform: str, user_id: str, note_id: int) -> bo
         return False
     try:
         async with DB_POOL.acquire() as conn:
-            result = await conn.execute("DELETE FROM user_notes WHERE id = $1;", note_id)
+            result = await conn.execute(
+                "DELETE FROM user_notes WHERE id = $1 AND platform = $2 AND user_id = $3;",
+                note_id, platform, str(user_id)
+            )
             return result.endswith("1")
     except Exception as e:
         logger.error(f"Lỗi xóa bài #{note_id}: {e}")
-        return False
-
-
-async def db_delete_user_data(platform: str, user_id: str) -> bool:
-    if not DB_POOL:
-        return False
-    try:
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE user_notes RESTART IDENTITY;")
-            return True
-    except Exception as e:
-        logger.error(f"Lỗi làm sạch dữ liệu: {e}")
         return False
 
 
@@ -399,7 +410,8 @@ async def ask_ai(prompt: str) -> str:
         "Content-Type": "application/json",
     }
     url = "https://api.groq.com/openai/v1/chat/completions"
-    candidate_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b"]
+    # Đưa model nhẹ lên đầu để tránh cạn kiệt hạn ngạch token
+    candidate_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
 
     last_error = ""
     for model in candidate_models:
@@ -410,12 +422,13 @@ async def ask_ai(prompt: str) -> str:
                     "role": "system",
                     "content": (
                         "Bạn là trợ lý học tập và ôn tập kiến thức chuyên nghiệp. "
-                        "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, gắn với thực tế."
+                        "Hãy tóm tắt và đặt câu hỏi ôn tập Active Recall bằng tiếng Việt súc tích, ngắn gọn."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.6,
+            "temperature": 0.5,
+            "max_tokens": 750,  # Khống chế token tránh lỗi 429
         }
         try:
             async with GLOBAL_SESSION.post(url, json=payload, headers=headers, timeout=25) as resp:
@@ -424,6 +437,10 @@ async def ask_ai(prompt: str) -> str:
                     choices = data.get("choices", [])
                     if choices:
                         return choices[0].get("message", {}).get("content", "").strip()
+                elif resp.status == 429:
+                    last_error = f"Model {model} chạm hạn ngạch (429 Rate Limit)"
+                    logger.warning(f"⚠️ {last_error}, đang chuyển model dự phòng...")
+                    continue
                 else:
                     err_msg = data.get("error", {}).get("message", str(data))
                     last_error = f"Model {model} ({resp.status}): {err_msg}"
@@ -944,7 +961,7 @@ async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if arg != "xacnhan":
         msg = (
             "⚠️ **CẢNH BÁO XÓA BỘ NHỚ!**\n\n"
-            "Lệnh này sẽ **xóa sạch toàn bộ bài học, tệp và ảnh** trên Cloud.\n\n"
+            "Lệnh này sẽ **xóa sạch toàn bộ bài học của bạn** trên Cloud.\n\n"
             "👉 Vui lòng gõ đúng cú pháp để xác nhận:\n"
             "`/xoatatca xacnhan`"
         )
@@ -954,7 +971,7 @@ async def xoatatca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await db_delete_user_data("telegram", chat_id)
     if success:
         await update.message.reply_text(
-            "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học trên Cloud!**\n"
+            "🧹 **Đã xóa sạch toàn bộ dữ liệu bài học của bạn trên Cloud!**\n"
             "Bộ nhớ đã được làm mới hoàn toàn. Bạn có thể dùng `/save` để bắt đầu lại! 🚀",
             parse_mode="Markdown"
         )
@@ -1476,7 +1493,7 @@ async def dispatch_lark_event(open_id: str, message: dict):
         parts = raw.split()
         if len(parts) > 1 and parts[1].lower() == "xacnhan":
             await db_delete_user_data("lark", open_id)
-            await send_lark_message(open_id, "🧹 Đã xóa sạch toàn bộ dữ liệu bài học trên Cloud!")
+            await send_lark_message(open_id, "🧹 Đã xóa sạch toàn bộ dữ liệu bài học của bạn trên Cloud!")
         else:
             await send_lark_message(open_id, "⚠️ Để xóa sạch bài học, hãy gõ chính xác: /xoatatca xacnhan")
     else:
