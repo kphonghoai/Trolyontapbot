@@ -1062,6 +1062,13 @@ async def handle_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Lỗi voice Telegram: {e}")
         await status_msg.edit_text(f"❌ Lỗi xử lý âm thanh: {e}")
 
+async def safe_reply_markdown(message, text: str, reply_markup=None):
+    """Gửi Markdown, nếu gặp lỗi cú pháp thì tự động gửi dưới dạng văn bản thường."""
+    try:
+        return await message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception:
+        clean_text = text.replace("*", "").replace("`", "").replace("_", "")
+        return await message.reply_text(clean_text, reply_markup=reply_markup)
 
 async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
@@ -1128,7 +1135,7 @@ async def handle_chat_with_groq(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     reply = await ask_ai(prompt)
-    await update.message.reply_text(reply)
+    await safe_reply_markdown(update.message, reply)
 
 
 async def telegram_handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1524,19 +1531,27 @@ async def dispatch_lark_event(open_id: str, message: dict):
 # --- BỘ LẬP LỊCH TỰ ĐỘNG & PUSH NOTIFICATION ĐỒNG BỘ HAI CHIỀU ---
 
 async def dynamic_scheduler_job(bot_instance):
+    global TRIGGERED_TIME_SLOTS
     now = datetime.now(LOCAL_TZ)
     current_time_str = now.strftime("%H:%M")
+    current_date_str = now.strftime("%Y-%m-%d")
     today_date = now.date()
 
     if not DB_POOL:
         return
 
-    # 1. Quét các bài học có HẸN GIỜ TÙY CHỌN (remind_at) -> BẮN THÔNG BÁO ĐỒNG THỜI CẢ 2 NỀN TẢNG
+    # Tự động làm sạch bộ đệm mốc giờ khi sang ngày mới
+    if current_time_str == "00:00":
+        TRIGGERED_TIME_SLOTS.clear()
+
+    # 1. Quét ghi chú HẸN GIỜ TÙY CHỌN (remind_at) -> Chỉ gửi đúng tài khoản sở hữu
     custom_due = await db_get_custom_remind_notes(now)
     if custom_due:
-        subscribers = await db_get_all_subscribers()
         for note in custom_due:
             n_id = note["id"]
+            owner_platform = note.get("platform")
+            owner_uid = note.get("user_id")
+
             prompt = (
                 f"Bài học: '{note['content']}'.\n"
                 "Hãy tạo 1 câu hỏi ôn tập Active Recall ngắn gọn bằng tiếng Việt để kiểm tra phản xạ ngay lúc này."
@@ -1549,35 +1564,35 @@ async def dynamic_scheduler_job(bot_instance):
                 f"{ai_q}"
             )
 
-            # Gửi đồng thời tới mọi tài khoản kết nối (Telegram & Lark)
-            for platform, uid in subscribers:
-                try:
-                    if platform == "telegram":
-                        sent_msg = await bot_instance.send_message(
-                            chat_id=int(uid),
-                            text=body,
-                            reply_markup=make_recall_keyboard(n_id),
-                            parse_mode="Markdown",
+            try:
+                if owner_platform == "telegram" and owner_uid:
+                    sent_msg = await bot_instance.send_message(
+                        chat_id=int(owner_uid),
+                        text=body,
+                        reply_markup=make_recall_keyboard(n_id),
+                        parse_mode="Markdown",
+                        disable_notification=False
+                    )
+                    try:
+                        await bot_instance.pin_chat_message(
+                            chat_id=int(owner_uid),
+                            message_id=sent_msg.message_id,
                             disable_notification=False
                         )
-                        try:
-                            await bot_instance.pin_chat_message(
-                                chat_id=int(uid),
-                                message_id=sent_msg.message_id,
-                                disable_notification=False
-                            )
-                        except Exception as pin_err:
-                            logger.warning(f"Không thể ghim tin nhắn #{n_id} trên Telegram: {pin_err}")
-                    elif platform == "lark":
-                        await send_lark_interactive_card(uid, title, body, n_id, header_color="red")
-                except Exception as send_err:
-                    logger.error(f"Lỗi gửi nhắc hẹn giờ (#{n_id}) tới {platform}:{uid}: {send_err}")
+                    except Exception as pin_err:
+                        logger.warning(f"Không thể ghim tin nhắn #{n_id} trên Telegram: {pin_err}")
+                elif owner_platform == "lark" and owner_uid:
+                    await send_lark_interactive_card(owner_uid, title, body, n_id, header_color="red")
+            except Exception as send_err:
+                logger.error(f"Lỗi gửi nhắc hẹn giờ (#{n_id}) tới {owner_platform}:{owner_uid}: {send_err}")
 
-            # Sau khi nhắc xong, hủy mốc hẹn giờ để tránh nhắc lặp lại
+            # Đã kích hoạt xong -> hủy lịch hẹn trên DB để không bị nhắc lặp
             await db_update_remind_time(n_id, None)
 
-    # 2. Khung giờ nhắc tổng kết đêm 22:00
-    if current_time_str == "22:00":
+    # 2. Khung giờ tổng kết đêm 22:00 (chống bắn lặp)
+    slot_22 = f"{current_date_str}_22:00"
+    if current_time_str == "22:00" and slot_22 not in TRIGGERED_TIME_SLOTS:
+        TRIGGERED_TIME_SLOTS.add(slot_22)
         msg = (
             "🌙 **Đến giờ tổng kết kiến thức ngày hôm nay!** 🌟✨\n\n"
             "Hôm nay bạn học được bài học mới nào? Hãy gửi ngay cú pháp:\n"
@@ -1594,50 +1609,52 @@ async def dynamic_scheduler_job(bot_instance):
                 logger.error(f"Lỗi gửi nhắc đêm tới {p}:{uid}: {e}")
         return
 
-    # 3. Khung giờ nhắc Spaced Repetition cố định: 10:00 sáng & 19:30 tối
+    # 3. Khung giờ nhắc Spaced Repetition (10:00 sáng & 19:30 tối - chống bắn lặp)
     is_morning = (current_time_str == "10:00")
     is_evening = (current_time_str == "19:30")
-    if not (is_morning or is_evening):
-        return
+    current_slot_key = f"{current_date_str}_{current_time_str}"
 
-    due_notes = await db_get_due_notes(today_date)
-    if not due_notes:
-        return
+    if (is_morning or is_evening) and current_slot_key not in TRIGGERED_TIME_SLOTS:
+        TRIGGERED_TIME_SLOTS.add(current_slot_key)
 
-    selected_note = due_notes[0]
-    session_name = "buổi sáng" if is_morning else "buổi tối"
-    prompt = (
-        f"Ghi chú: '{selected_note['content']}'.\n"
-        f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
-    )
-    ai_q = await ask_ai(prompt)
-    title = "☀️ Active Recall Sáng Nay: 🧠🔥" if is_morning else "🎯 Tình Huống Vận Dụng Tối Nay: 🚀✨"
-    body = (
-        f"**{title}**\n\n"
-        f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
-        f"{ai_q}"
-    )
+        due_notes = await db_get_due_notes(today_date)
+        if not due_notes:
+            return
 
-    n_id = selected_note["id"]
-    subscribers = await db_get_all_subscribers()
-    for platform, uid in subscribers:
-        try:
-            if platform == "telegram":
-                sent_msg = await bot_instance.send_message(
-                    chat_id=int(uid),
-                    text=body,
-                    reply_markup=make_recall_keyboard(n_id),
-                    parse_mode="Markdown",
-                    disable_notification=False
-                )
-                try:
-                    await bot_instance.pin_chat_message(chat_id=int(uid), message_id=sent_msg.message_id, disable_notification=False)
-                except Exception:
-                    pass
-            elif platform == "lark":
-                await send_lark_interactive_card(uid, title, body, n_id, header_color="orange")
-        except Exception as e:
-            logger.error(f"Lỗi gửi nhắc định kỳ ({platform}:{uid}): {e}")
+        selected_note = due_notes[0]
+        session_name = "buổi sáng" if is_morning else "buổi tối"
+        prompt = (
+            f"Ghi chú: '{selected_note['content']}'.\n"
+            f"Hãy tạo 1 câu hỏi đánh giá nhanh Active Recall dành cho {session_name} bằng tiếng Việt."
+        )
+        ai_q = await ask_ai(prompt)
+        title = "☀️ Active Recall Sáng Nay: 🧠🔥" if is_morning else "🎯 Tình Huống Vận Dụng Tối Nay: 🚀✨"
+        body = (
+            f"**{title}**\n\n"
+            f"📖 *Bài học #{selected_note['id']}:* {selected_note['content'][:120]}...\n\n"
+            f"{ai_q}"
+        )
+
+        n_id = selected_note["id"]
+        subscribers = await db_get_all_subscribers()
+        for platform, uid in subscribers:
+            try:
+                if platform == "telegram":
+                    sent_msg = await bot_instance.send_message(
+                        chat_id=int(uid),
+                        text=body,
+                        reply_markup=make_recall_keyboard(n_id),
+                        parse_mode="Markdown",
+                        disable_notification=False
+                    )
+                    try:
+                        await bot_instance.pin_chat_message(chat_id=int(uid), message_id=sent_msg.message_id, disable_notification=False)
+                    except Exception:
+                        pass
+                elif platform == "lark":
+                    await send_lark_interactive_card(uid, title, body, n_id, header_color="orange")
+            except Exception as e:
+                logger.error(f"Lỗi gửi nhắc định kỳ ({platform}:{uid}): {e}")
 
 
 async def scheduler_loop(application):
