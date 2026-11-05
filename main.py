@@ -882,8 +882,8 @@ async def ontap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     arg_id = context.args[0] if context.args else ""
     res, note_id = await handle_ontap_command_core("telegram", chat_id, arg_id)
-if note_id:
-       await safe_reply_markdown(update.message, res, reply_markup=make_recall_keyboard(note_id))
+    if note_id:
+        await safe_reply_markdown(update.message, res, reply_markup=make_recall_keyboard(note_id))
     else:
         await safe_reply_markdown(update.message, res)
 
